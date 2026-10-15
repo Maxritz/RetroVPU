@@ -1,0 +1,18 @@
+{
+  "hardware": {
+    "cpu": "Intel Core Ultra 5 135H",
+    "gpu": "Intel Arc iGPU (128 EU)",
+    "npu": "Intel NPU (available via OpenVINO)",
+    "ram": "16 GB",
+    "machine": "ThinkPad L14"
+  },
+  "os": "Windows",
+  "languages": {
+    "host": "C++20",
+    "kernel": "OpenVINO IR"
+  },
+  "api_targets": ["OpenVINO"],
+  "implementers": ["AI agents"],
+  "oracle_policy": "no forbidden black-box usage",
+  "test_environment": "Pure CPU (per oracle policy)"
+}
