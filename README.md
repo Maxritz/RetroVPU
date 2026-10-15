@@ -56,15 +56,17 @@ No code is copied from forbidden repositories. The only third-party code incorpo
 
 | Variant | Method Tag | Median (µs) | 95% CI (µs) | Speedup |
 |---------|-----------|-------------|-------------|---------|
-| Baseline (dense, FP32) | V12.NONE | 77,476 | 52,085 - 92,701 | 1.00x (ref) |
-| Elision only | V12.ELIDE | 3,154 | 2,858 - 3,744 | 24.56x |
-| Fusion only | V12.FUSE | 3,038 | 2,870 - 3,767 | 25.50x |
-| Precision only | V12.PRECISION | 2,983 | 2,813 - 3,550 | 25.97x |
-| Fused + Elided + Precision | V12.FUSE\|ELIDE\|PRECISION | 2,979 | 2,827 - 4,594 | 26.00x |
+| Baseline (dense, FP32) | V12.NONE | 40,258 | 33,538 - 48,376 | 1.00x (ref) |
+| Elision only | V12.ELIDE | 2,163 | 2,035 - 3,047 | 18.62x |
+| Fusion only | V12.FUSE | 2,387 | 2,079 - 3,148 | 16.87x |
+| Precision only | V12.PRECISION | 2,185 | 2,029 - 3,589 | 18.42x |
+| Fused + Elided + Precision | V12.FUSE\|ELIDE\|PRECISION | 2,122 | 2,009 - 2,986 | 18.97x |
 
-**Combined V12 speedup:** 26.00x (CI: 16.86 - 27.41), statistically significant
+**Combined V12 speedup:** 18.97x (CI: 13.48 - 20.04), statistically significant
 
-**Key finding:** V12.ELIDE (sparse top-K dispatch) provides the dominant win. Computing 2 of 8 experts instead of all 8 yields ~19x speedup. V12.FUSE and V12.PRECISION provide marginal additional gains (2-4%) over elision alone, as they both include the elision optimisation. To isolate fuse and precision contributions, future ablations should compare elide-only vs elide+fuse, and elide-only vs elide+precision.
+**Key finding:** V12.ELIDE (sparse top-K dispatch) provides the dominant win. Computing 2 of 8 experts instead of all 8 yields ~18-19x speedup. V12.FUSE and V12.PRECISION provide marginal additional gains over elision alone, as they both include the elision optimisation. To isolate fuse and precision contributions, future ablations should compare elide-only vs elide+fuse, and elide-only vs elide+precision.
+
+**Variance note:** Run-to-run speedup ranged from 17x to 26x across four full benchmark runs on this laptop (thermal effects on the baseline; the ratio stays directionally stable). All individual measurements and CIs are archived in `benchmark_results.json`.
 
 All results saved to `benchmark_results.json` after each run.
 
