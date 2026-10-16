@@ -1,0 +1,69 @@
+// Clean-room batched q8.0 matvec for V12-VPU.
+//
+// Same integer math as matvec_gguf_v12.comp (R4: bit-identical), but one
+// workgroup per (row, token) so a full token-batch of K/V/Q/FFN projections
+// is computed in a SINGLE dispatch instead of `ntok` serial dispatches.
+// Collapses host round-trips (buffer create/describe/readback dominate on
+// Xe-LPG — see R7) which is the cost-gated lever, not GPU queues.
+//
+// Push constants (shared pc.h, 128 bytes): count=rows, width=k, in_w=ntok, in_h=ng.
+// Buffers: 0=W(q8_0 raw bytes) 1=act int8[ntok*k] 2=actscale float[ntok*ng] 3=out float[ntok*rows]
+// outv layout: outv[tok*rows + row]  (row-major per token)
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#include "gguf_decode.glsl"
+#include "v12_trace.glsl"
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+const uint MIN_SUBGROUP = 8u;
+shared float s_part[LOCAL_X / MIN_SUBGROUP];
+layout(local_size_x = LOCAL_X) in;
+
+// activation int8 code for token `tok`, element `e` (flat aq is token-major: tok*k+e)
+int a8b(uint tok, uint e) {
+    uint off = tok * pc.width + e;
+    uint v = (aq[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+    return int(v < 128u ? v : v - 256u);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint tok = gl_WorkGroupID.y;
+    if (tok >= pc.in_w) return;
+    uint rb = row * ((pc.width / BLK) * BPB);
+    uint ng = pc.width / GROUP;
+    uint lane = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    uint tDec = 0u, tMac = 0u, tScl = 0u, tRed = 0u;
+    for (uint g = lane; g < ng; g += LOCAL_X) {
+        float wsc0 = 0.0, wmn0 = 0.0;
+        int S = 0, T = 0;
+        uvec2 t = v12_now();
+        for (uint l = 0u; l < GROUP; ++l) {
+            int c; float ws, wm;
+            wdec(g * GROUP + l, rb, c, ws, wm);
+            uvec2 t1 = v12_now(); tDec += v12_dt(t, t1); t = t1;
+            if (l == 0u) { wsc0 = ws; wmn0 = wm; }
+            int ac = a8b(tok, g * GROUP + l);
+            S += c * ac;
+            T += ac;
+            t = v12_now(); tMac += v12_dt(t1, t);
+        }
+        uvec2 t2 = v12_now(); tScl += v12_dt(t, t2); t = t2;
+        acc += ad[tok * ng + g] * (wsc0 * float(S) - wmn0 * float(T));
+    }
+    uvec2 tRedStart = v12_now();
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) t += s_part[s];
+        outv[tok * pc.count + row] = t;
+    }
+    uvec2 tr = v12_now(); tRed += v12_dt(tRedStart, tr);
+    V12_TRACE_STORE(row * LOCAL_X + tok * pc.count + lane, tDec, tMac, tScl, tRed);
+}

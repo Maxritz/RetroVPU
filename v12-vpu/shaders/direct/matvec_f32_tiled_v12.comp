@@ -1,0 +1,49 @@
+#version 450
+// V12-VPU generated: tiled matvec with tile-based work organization (Kyro-inspired)
+// Workgroup processes MULTIPLE rows sharing a vector tile in shared memory.
+// Principle: collect/bucket work by tile before spending expensive memory loads.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+#define TILE_K 64      // vector tile size fitting in shared memory
+#define WG_ROWS 1
+shared float s_vec[TILE_K];
+void main() {
+    uint wid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = wid * WG_ROWS;
+    // Initialize accumulators for this workgroup's rows
+    float acc[WG_ROWS];
+    for (uint r = 0; r < WG_ROWS; r++) {
+        uint row = row0 + r;
+        acc[r] = 0.0;
+        if (row >= pc.count) acc[r] = 0.0; // will be discarded later
+    }
+    // Process vector in tiles of TILE_K elements
+    uint k = pc.width;
+    for (uint tile = 0; tile < k; tile += TILE_K) {
+        // Cooperative load: each thread loads one vector element into shared memory
+        uint idx = tile + (tid & 63u);
+        if (idx < k) s_vec[tid & 63u] = vecB[idx];
+        barrier();
+        // Each thread processes one element for its assigned rows
+        // Thread tid handles element (tid & 63) of the vector for all WG_ROWS rows
+        uint vec_idx = tile + (tid & 63u);
+        if (vec_idx < k) {
+            for (uint r = 0; r < WG_ROWS; r++) {
+                uint row = row0 + r;
+                if (row < pc.count) {
+                    acc[r] += matA[row * k + vec_idx] * s_vec[tid & 63u];
+                }
+            }
+        }
+        barrier();
+    }
+    // Write results
+    for (uint r = 0; r < WG_ROWS; r++) {
+        uint row = row0 + r;
+        if (row < pc.count) outData[row] = acc[r];
+    }
+}

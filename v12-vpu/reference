@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""CPU reference implementations and input data generation for V12-VPU benchmarks."""
+from __future__ import annotations
+import numpy as np
+import struct
+
+
+# ── Workload: transform + scale/bias + dot ────────────────────────
+
+def gen_transform_data(size: int, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    input_a = rng.standard_normal(size * 4).astype(np.float32)
+    input_b = rng.standard_normal(size * 4).astype(np.float32)
+    matrix = np.eye(4, dtype=np.float32).flatten()
+    bias   = np.array([0.25, -0.5, 1.0, 0.0], dtype=np.float32)
+    scale  = np.array([2.0, 0.5, 1.0, 1.0], dtype=np.float32)
+    sbbias = np.array([0.0, 1.0, 0.0, -1.0], dtype=np.float32)
+    return input_a, input_b, matrix, bias, scale, sbbias
+
+def ref_transform(input_a, input_b, matrix, bias, scale, sbbias):
+    n = len(input_a) // 4
+    a = input_a.reshape(n, 4)
+    b = input_b.reshape(n, 4)
+    m = a @ matrix.reshape(4, 4).T + bias
+    s = m * scale + sbbias
+    d = np.sum(s * b, axis=1)
+    return d
+
+# ── Workload: float32 matrix-vector ────────────────────────────────
+
+def gen_matvec_f32_data(rows: int, cols: int, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    mat = rng.standard_normal(rows * cols).astype(np.float32)
+    vec = rng.standard_normal(cols).astype(np.float32)
+    return mat, vec
+
+def ref_matvec_f32(mat, vec):
+    cols = len(vec)
+    m = mat.reshape(len(mat) // cols, cols)
+    return m @ vec
+
+# ── Workload: quantised int8 matrix-vector ─────────────────────────
+
+def gen_matvec_q8_data(rows: int, cols: int, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    mat = rng.integers(-128, 128, size=rows * cols).astype(np.int8)
+    vec = rng.integers(-128, 128, size=cols).astype(np.int8)
+    scales = rng.standard_normal(rows).astype(np.float32) * 0.01
+    return mat, vec, scales
+
+def pack_i8_to_uvec4(arr: np.ndarray) -> np.ndarray:
+    n = len(arr)
+    padded = np.zeros(((n + 3) // 4) * 4, dtype=np.uint8)
+    padded[:n] = arr.view(np.uint8)
+    return padded.view(np.uint32)
+
+def ref_matvec_q8(mat, vec, scales):
+    cols = len(vec)
+    m = mat.reshape(len(mat) // cols, cols)
+    acc = (m.astype(np.int32) * vec.astype(np.int32)).sum(axis=1).astype(np.float32)
+    return acc * scales
+
+# ── Workload: 2D convolution ─────────────────────────────────────
+
+def gen_conv2d_data(in_h: int, in_w: int, k_size: int = 3, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    image = rng.standard_normal(in_h * in_w).astype(np.float32)
+    kernel = rng.standard_normal(k_size * k_size).astype(np.float32)
+    return image, kernel, k_size
+
+def ref_conv2d(image, kernel, k_size, in_w, in_h):
+    r = k_size // 2
+    out_w = in_w - 2 * r
+    out_h = in_h - 2 * r
+    out = np.zeros(out_h * out_w, dtype=np.float32)
+    k = kernel.reshape(k_size, k_size)
+    img = image.reshape(in_h, in_w)
+    for oy in range(out_h):
+        for ox in range(out_w):
+            window = img[oy:oy+k_size, ox:ox+k_size]
+            out[oy * out_w + ox] = float(np.sum(window * k))
+    return out
+
+# ── Push constant builders ────────────────────────────────────────
+
+def transform_pc_hex(count: int, matrix, bias, scale, sbbias) -> str:
+    """Build 128-byte push constant for transform (matches shaders/pc.h)."""
+    pc = bytearray(128)
+    struct.pack_into('<I', pc, 0, count)
+    mat = np.asarray(matrix, dtype=np.float32).flatten()
+    for i in range(min(16, len(mat))): struct.pack_into('<f', pc, 16+i*4, float(mat[i]))
+    for i in range(4): struct.pack_into('<f', pc, 80+i*4, float(bias[i]))
+    for i in range(4): struct.pack_into('<f', pc, 96+i*4, float(scale[i]))
+    for i in range(4): struct.pack_into('<f', pc, 112+i*4, float(sbbias[i]))
+    return pc.hex()
+
+def simple_pc_hex(count: int, width: int = 0) -> str:
+    """Build 128-byte push constant for matvec workloads."""
+    pc = bytearray(128)
+    struct.pack_into('<I', pc, 0, count)
+    if width > 0: struct.pack_into('<I', pc, 4, width)
+    return pc.hex()
+
+def conv2d_pc_hex(count: int, out_w: int, in_w: int, in_h: int) -> str:
+    pc = bytearray(128)
+    struct.pack_into('<I', pc, 0, count)
+    struct.pack_into('<I', pc, 4, out_w)
+    struct.pack_into('<I', pc, 8, in_w)
+    struct.pack_into('<I', pc, 12, in_h)
+    return pc.hex()
+
+def save_pc(path: str, pc_hex: str):
+    with open(path, 'wb') as f:
+        f.write(bytes.fromhex(pc_hex))
+
+# ── Save/load binary ──────────────────────────────────────────────
+
+def save_binary(path: str, data: np.ndarray):
+    data = np.ascontiguousarray(data)
+    with open(path, 'wb') as f:
+        f.write(data.tobytes())
+
+def save_bytes(path: str, data: bytes):
+    with open(path, 'wb') as f:
+        f.write(data)
+
+def save_floats(path: str, floats):
+    with open(path, 'wb') as f:
+        for v in floats:
+            f.write(struct.pack('<f', float(v)))
+
+
+# ── Workload: attention ────────────────────────────────────────────
+
+HEAD_DIM = 64
+
+def gen_attention_data(n: int, head_dim: int = HEAD_DIM, seed: int = 42):
+    """Generate hidden states and reference attention output (simplified self-attention)."""
+    rng = np.random.default_rng(seed)
+    hidden = rng.standard_normal(n * head_dim).astype(np.float32) * 0.1
+    ref = ref_attention(hidden, n, head_dim)
+    return hidden, ref
+
+def ref_attention(hidden, n: int, head_dim: int = HEAD_DIM):
+    """Compute scaled dot-product attention scores matrix (n x n)."""
+    h = hidden.reshape(n, head_dim)
+    scores = np.zeros((n, n), dtype=np.float32)
+    for i in range(n):
+        for j in range(n):
+            scores[i, j] = np.dot(h[i], h[j]) / np.sqrt(head_dim)
+    return scores.flatten()

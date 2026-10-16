@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_debug_printf : enable
+// silu_mul.comp - fused SiLU(gate) * up, elementwise over the FFN width.
+// V12.LAZY: branchless stable sigmoid (shortest correct path).
+// Paper: 2602.11808 DeepFusionKernel; 2608.03537 ComFuse (memory-bound elementwise fusion).
+// Phi-3: count = ffn length = 8192 (GGUF blk.*.ffn_up holds [gate(8192);up(8192)]).
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly  buffer GateBuf { float gate[]; };
+layout(set=0, binding=1, std430) readonly  buffer UpBuf   { float up[]; };
+layout(set=0, binding=2, std430) writeonly buffer MidBuf  { float mid[]; };
+#include "pc.h"
+// pc.count = number of MLP elements per token (8192)
+
+// Branchless numerically stable sigmoid: sigmoid(x)=e/(1+e) with e=exp(-|x|),
+// reflected for x<0. Correct on both tails, no branch divergence.
+float sigmoid_stable(float x) {
+    float e = exp(-abs(x));
+    float s = e / (1.0 + e);          // = sigmoid(-|x|)
+    return (x >= 0.0) ? (1.0 - s) : s;
+}
+
+void main() {
+    uint total = pc.count;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        float g = gate[i];
+        // Debug tag: [silu_mul::branchless_fma]
+        float silu = g * sigmoid_stable(g);
+        // Debug tag: [silu_mul::fused_act]  (activation fused with the up multiply)
+        mid[i] = silu * up[i];
+    }
+
+    // Debug tag: [silu_mul::complete]
+    if (gl_GlobalInvocationID.x == 0u)
+        debugPrintfEXT("[silu_mul::complete] elems=%u\n", total);
+}

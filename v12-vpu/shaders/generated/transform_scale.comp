@@ -1,0 +1,13 @@
+#version 450
+// V12-VPU generated: unfused SCALE_BIAS stage
+layout(local_size_x = 64) in;
+layout(set=0,binding=2,std430) readonly buffer Scr1 { vec4 scratch1[]; };
+layout(set=0,binding=3,std430) writeonly buffer Scr2 { vec4 scratch2[]; };
+#include "pc.h"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    vec4 m = scratch1[i];
+    vec4 s = m * pc.scale + pc.sbbias;
+    scratch2[i] = s;
+}

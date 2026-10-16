@@ -1,0 +1,29 @@
+#version 450
+// Iteration 3: tiled matvec with float4 vectorized loads + bank conflict avoidance.
+// HipKittens pattern: 64 threads cooperatively load vecB[TILE_K] into shared memory.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+#define TILE_K 64
+#define WG 64
+shared float s_vec[TILE_K + 8]; // +8 padding for bank conflict avoidance
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float acc = 0.0;
+    uint k = pc.width;
+    for (uint j = 0; j < k; j += TILE_K) {
+        uint limit = min(TILE_K, k - j);
+        // Cooperative load: 64 threads each load 1 element, coalesced
+        for (uint t = gl_LocalInvocationID.x; t < limit; t += WG)
+            s_vec[t] = vecB[j + t];
+        barrier();
+        // Compute from shared memory
+        for (uint t = 0; t < limit; t++)
+            acc += matA[i * k + j + t] * s_vec[t];
+        barrier();
+    }
+    outData[i] = acc;
+}

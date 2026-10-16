@@ -1,0 +1,46 @@
+#version 450
+// attention_v12_2dtile.comp - CORRECTED shared-mem attention (replaces the broken iter3).
+// Research finding that made iter3 2.4-5.9x SLOWER than direct: under 1-WG-per-row mapping,
+// each KEY column has a single reader, so caching keys in shared has ZERO reuse -> the tile
+// load + 2 barriers were pure overhead. Fix: tile BOTH query-rows (BR) and key-cols (BC) in one
+// workgroup, so the key tile is reused by BR query rows and the query tile by BC key cols.
+// Semantics IDENTICAL to direct_simple: S[i,j] = (H[i].H[j]) / sqrt(HEAD_DIM), H is n x 64.
+// Provenance (AGONS.md): clean-room.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Hid { vec4 h[]; };   // n rows x 64 f32 = n*16 vec4
+layout(set=0, binding=1, std430) writeonly buffer Out { float o[]; };
+#include "pc.h"
+#define HEAD_DIM 64
+#define N4       (HEAD_DIM/4)     // 16
+#define BR 16                    // query-rows per tile
+#define BC 16                    // key-cols per tile (BR*BC=256 scores, 64 thr -> 4/row)
+#define STRIDE (HEAD_DIM+1)      // 65: bank-conflict-free pitch
+shared float sq[BR*STRIDE];      // query tile  (reused across BC cols)
+shared float sk[BC*STRIDE];      // key tile    (reused across BR rows)
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint bx = gl_WorkGroupID.x, by = gl_WorkGroupID.y;
+    uint n  = pc.count;
+    uint r0 = bx * BR, c0 = by * BC;
+    if (r0 >= n) return;
+    float scale = 1.0 / sqrt(float(HEAD_DIM));
+    // cooperatively load BR query rows (BR*HEAD_DIM = 1024 floats)
+    uint qtot = BR * HEAD_DIM;
+    for (uint t = tx; t < qtot; t += 64u) { uint r=t/HEAD_DIM, d=t%HEAD_DIM; sq[r*STRIDE+d] = float(h[(r0+r)*N4 + d/4][d%4]); }
+    // cooperatively load BC key cols (BC*HEAD_DIM = 1024 floats)
+    uint ktot = BC * HEAD_DIM;
+    for (uint t = tx; t < ktot; t += 64u) { uint c=t/HEAD_DIM, d=t%HEAD_DIM; sk[c*STRIDE+d] = float(h[(c0+c)*N4 + d/4][d%4]); }
+    barrier();
+    // each thread computes 4 (row,col) scores in the tile; reads query+key from shared (reused)
+    uint nsc = BR * BC;
+    for (uint s = tx; s < nsc; s += 64u) {
+        uint rr=s/BC, cc=s%BC;
+        uint row = r0+rr, col = c0+cc;
+        if (row >= n || col >= n) continue;
+        float acc = 0.0;
+        for (uint d = 0u; d < HEAD_DIM; d++) acc += sq[rr*STRIDE+d] * sk[cc*STRIDE+d];
+        o[row*n + col] = acc * scale;
+    }
+    // no second barrier: shared is read-only after load; each (row,col) written by exactly one thread
+}

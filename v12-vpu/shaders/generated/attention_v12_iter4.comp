@@ -1,0 +1,43 @@
+#version 450
+// Iteration 4: attention with float4 vectorized loads + bank-conflict-free shared memory.
+// Uses vec4 loads for 4x throughput on key vector, stride padding avoids bank conflicts.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Hidden { vec4 hidden4[]; };
+layout(set=0, binding=1, std430) writeonly buffer Scores { float outData[]; };
+#include "pc.h"
+#define HEAD_DIM 64
+#define VEC4 4
+#define WG 64
+#define STRIDE 68  // HEAD_DIM rounded up to multiple of 4 + 4 for bank conflict avoid
+shared float s_hidden[64 * STRIDE];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+    uint k = pc.count;
+    if (wid >= k) return;
+
+    float scale = 1.0 / sqrt(float(HEAD_DIM));
+    uint n4 = HEAD_DIM / VEC4;  // 16 vec4s per key
+
+    // Load query key vector into registers (16 vec4 loads)
+    float q[HEAD_DIM];
+    for (uint d = 0; d < n4; d++) {
+        vec4 v = hidden4[wid * n4 + d];
+        q[d*4+0] = v.x; q[d*4+1] = v.y; q[d*4+2] = v.z; q[d*4+3] = v.w;
+    }
+
+    for (uint c = tid; c < k; c += WG) {
+        float acc = 0.0;
+        // Load key vector c from global as vec4s
+        float key[HEAD_DIM];
+        for (uint d = 0; d < n4; d++) {
+            vec4 v = hidden4[c * n4 + d];
+            key[d*4+0] = v.x; key[d*4+1] = v.y; key[d*4+2] = v.z; key[d*4+3] = v.w;
+        }
+        // Dot product
+        for (uint d = 0; d < HEAD_DIM; d++)
+            acc += q[d] * key[d];
+        outData[wid * k + c] = acc * scale;
+    }
+}

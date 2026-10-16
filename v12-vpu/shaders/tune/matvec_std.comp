@@ -1,0 +1,28 @@
+#version 450
+// STANDARD organization: one invocation per output row, scalar, serial over K.
+// Tuning knobs: LOCAL_X (workgroup size), U (unroll factor).
+#ifndef LOCAL_X
+#define LOCAL_X 64
+#endif
+#ifndef U
+#define U 8
+#endif
+layout(local_size_x = LOCAL_X) in;
+layout(set=0, binding=0, std430) readonly  buffer Mat { float matA[]; };
+layout(set=0, binding=1, std430) readonly  buffer Vec { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    uint k = pc.width;
+    uint base = i * k;
+    float acc = 0.0;
+    uint j = 0u;
+    for (; j + U <= k; j += U) {
+        for (uint t = 0u; t < U; ++t) acc = fma(matA[base + j + t], vecB[j + t], acc);
+    }
+    for (; j < k; ++j) acc = fma(matA[base + j], vecB[j], acc);
+    outData[i] = acc;
+}

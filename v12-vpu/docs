@@ -1,0 +1,59 @@
+# Virtual ISA for V12-VPU
+
+## Design principle
+
+A program describes **per-element** computation. The compiler lowers it to a
+compute shader where each invocation processes one element. The workgroup
+size (`local_size_x = 64`) determines parallelism; the push-constant `count`
+determines how many elements are processed in total.
+
+## Instruction set
+
+| Instruction | Inputs              | Output  | Numerical semantics                          | Origin                  |
+|-------------|---------------------|---------|----------------------------------------------|-------------------------|
+| `LOAD`      | buffer, index `r`   | `t`     | Read element at `index` from bound buffer    | Virtual ISA infra       |
+| `STORE`     | `val`, buffer, index| —       | Write `val` to bound buffer at `index`       | Virtual ISA infra       |
+| `MOV`       | `src`               | `dst`   | Bitwise copy                                 | Virtual ISA infra       |
+| `MAT4`      | `src`, 16+4 imm     | `dst`   | `dst[i] = dot(row_i, src) + bias[i]`         | V12-inspired            |
+| `SCALE_BIAS`| `src`, 4+4 imm      | `dst`   | `dst[i] = src[i]*s[i] + b[i]`                | V12-inspired            |
+| `TEX_LOOKUP`| `src`, table memory  | `dst`   | Clamp-to-edge LUT index per component        | V12-inspired            |
+| `DOT_F32`   | `a`, `b`            | scalar  | `dot4(a, b)` → 32-bit float                  | New AI extension        |
+| `DOT_I8`    | `a`, `b` (int8)     | scalar  | `Σ aᵢ·bᵢ` accumulated in int32               | New AI extension        |
+| `MATVEC_Q8` | `w` (int8 matrix), `x` (int8 vec), `s` (scales) | float | `y[i] = Σ w[i][j]*x[j] * s[i]` | New AI extension |
+| `REDUCE_SUM`| `src`               | scalar  | Sum of vec4 components                       | New AI extension        |
+
+### Quantised dot product (DOT_I8) semantics
+
+- Input values are signed 8-bit integers in `[-128, 127]`.
+- Products are accumulated exactly in a 32-bit signed integer.
+- Result is returned as a 32-bit float.
+- Overflow **wraps** (two's complement), matching hardware behaviour.
+- Both implementations must use identical accumulation width and overflow rules.
+
+### Quantised matrix-vector (MATVEC_Q8) semantics
+
+- Matrix `W` is `M × K`, stored row-major as packed int8 (4 bytes per row-element group = vec4).
+- Vector `x` is `K` int8 values.
+- Per-row scale `s[i]` is a float.
+- `y[i] = (Σⱼ W[i][j] · x[j]) · s[i]`
+- Same overflow and accumulation rules as DOT_I8.
+
+## IR representation
+
+```
+LOAD   r0, inA, idx          # r0 = inputA[gl_GlobalInvocationID.x]
+MAT4   r1, r0, <16+4 imm>     # r1 = M * r0 + bias
+SCALE_BIAS r2, r1, <8 imm>     # r2 = scale * r1 + bias
+LOAD   r3, inB, idx           # r3 = inputB[idx]
+DOT_F32 r4, r2, r3            # r4 = dot(r2, r3)
+STORE  outData, idx, r4
+```
+
+## Compiler pipeline
+
+1. **Validate**: Check register usage, type compatibility, memory bounds.
+2. **Optimise**: Eliminate redundant loads, dead stores, constant-fold imm.
+3. **Fusion**: Merge compatible instructions into a single shader when
+   no intermediate store is required.
+4. **Shader codegen**: Emit GLSL compute shader.
+5. **SPIR-V compilation**: `glslc -fshader-stage=compute shader.comp -o shader.spv`

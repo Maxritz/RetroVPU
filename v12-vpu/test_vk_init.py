@@ -1,0 +1,12 @@
+from v4_runtime.vulkan_runtime import VulkanRuntime
+rt = VulkanRuntime()
+rt.initialize()
+print('Instance OK')
+rt.pick_physical_device()
+print('Device picked')
+rt.create_device()
+print('Device created')
+rt.create_command_pool()
+print('Command pool OK')
+rt.cleanup()
+print('All Vulkan init steps passed')

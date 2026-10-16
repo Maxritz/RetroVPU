@@ -1,0 +1,465 @@
+#include "v12_compiler.hpp"
+#include <sstream>
+#include <algorithm>
+#include <stdexcept>
+#include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+
+namespace v12 {
+
+// ── IR workload definitions ─────────────────────────────────────────────────
+
+Program make_transform_ir() {
+    return Program{
+        .instrs = {
+            {"LOAD", "a"},            // load input vec4
+            {"MAT4", "m", {"a"}},     // 4x4 transform + bias
+            {"SCALE_BIAS", "s", {"m"}},
+            {"LOAD", "b"},
+            {"DOT_F32", "d", {"s", "b"}},
+            {"STORE", "", {"d", "output"}},
+        },
+        .output = "d",
+        .name  = "transform_scale_dot",
+    };
+}
+
+Program make_matvec_f32_ir() {
+    return Program{
+        .instrs = {
+            {"LOAD", "row"},           // load matrix row
+            {"LOAD", "vec"},
+            {"DOT_F32", "result", {"row", "vec"}},
+            {"STORE", "", {"result", "output"}},
+        },
+        .output = "result",
+        .name   = "matvec_f32",
+    };
+}
+
+Program make_matvec_q8_ir() {
+    return Program{
+        .instrs = {
+            {"LOAD", "row_i8"},         // load int8 matrix row
+            {"LOAD", "vec_i8"},
+            {"DOT_I8", "acc", {"row_i8", "vec_i8"}},
+            {"SCALE", "scaled", {"acc"}},
+            {"STORE", "", {"scaled", "output"}},
+        },
+        .output = "scaled",
+        .name   = "matvec_q8",
+    };
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+ValidationResult Validator::validate(const Program& prog) {
+    std::unordered_set<std::string> defined;
+    std::unordered_set<std::string> used;
+
+    for (const auto& ins : prog.instrs) {
+        if (ins.op == Op::Invalid) {
+            return {.ok = false, .error = "invalid instruction op"};
+        }
+
+        for (const auto& s : ins.src) {
+            if (s != "input" && s != "weights" && s != "vec" && s != "row" &&
+                s != "row_i8" && s != "vec_i8" && s != "output" &&
+                defined.find(s) == defined.end()) {
+                return {.ok = false,
+                    .error = "undefined register: " + s + " in " + op_name(ins.op)};
+            }
+            used.insert(s);
+        }
+
+        if (!ins.dst.empty() && ins.op != Op::Store) {
+            if (defined.count(ins.dst)) {
+                return {.ok = false, .error = "duplicate definition: " + ins.dst};
+            }
+            defined.insert(ins.dst);
+        }
+    }
+
+    if (defined.find(prog.output) == defined.end()) {
+        return {.ok = false, .error = "output register not defined: " + prog.output};
+    }
+    return {.ok = true};
+}
+
+// ── Optimizer ─────────────────────────────────────────────────────────────────
+
+Program Optimizer::optimize(const Program& prog, Stats* stats) {
+    Program out = prog;
+    std::unordered_map<std::string, std::string> copy_prop;  // src -> canonical
+
+    for (auto& ins : out.instrs) {
+        // Copy propagation (MOV elimination)
+        if (ins.op == Op::Mov) {
+            copy_prop[ins.dst] = ins.src.empty() ? "" : ins.src[0];
+            if (stats) stats->folded_consts++;
+            continue;
+        }
+
+        // Substitute copy-propagated sources
+        for (auto& s : ins.src) {
+            auto it = copy_prop.find(s);
+            if (it != copy_prop.end()) s = it->second;
+        }
+    }
+
+    // Remove dead MOVs
+    Program result;
+    for (const auto& ins : out.instrs) {
+        if (ins.op == Op::Mov) continue;
+        result.instrs.push_back(ins);
+    }
+    result.output = prog.output;
+    result.name   = prog.name;
+    return result;
+}
+
+// ── Fusion analyser ──────────────────────────────────────────────────────────
+
+FusionPlan FusionAnalyzer::analyze(const Program& prog) {
+    bool has_store = false, has_load = false;
+    for (const auto& i : prog.instrs) {
+        if (i.op == Op::Store) has_store = true;
+        if (i.op == Op::Load)  has_load  = true;
+    }
+
+    // All current workloads can be fully fused
+    bool all_fusable = true;
+    for (const auto& i : prog.instrs) {
+        switch (i.op) {
+            case Op::Load: case Op::Store: case Op::Mov:
+            case Op::Mat4: case Op::ScaleBias: case Op::DotF32:
+            case Op::DotI8: case Op::ReduceSum:
+                break;
+            default:
+                all_fusable = false;
+        }
+    }
+
+    return FusionPlan{
+        .level = all_fusable ? FusionLevel::Fused : FusionLevel::Auto,
+        .needs_tiling = (prog.name == "matvec_f32" || prog.name == "matvec_q8"),
+        .hint = all_fusable ? "fully fusable" : "requires multi-dispatch"
+    };
+}
+
+// ── GLSL generator ───────────────────────────────────────────────────────────
+
+std::string GLSLGenerator::generate(const Program& prog, const ShaderSpec& spec) {
+    std::ostringstream oss;
+    oss << "#version 450\n";
+    oss << "// V12-VPU generated shader: " << prog.name << "\n";
+    if (spec.use_tiling)
+        oss << "// Tiling: tile_size=" << spec.tile_size << "\n";
+    oss << "layout(local_size_x = " << spec.workgroup << ") in;\n\n";
+
+    // Buffer declarations depend on workload
+    if (prog.name == "transform_scale_dot") {
+        oss << "layout(set=0,binding=0,std430) readonly buffer InA  { vec4  inA[]; };\n";
+        oss << "layout(set=0,binding=1,std430) readonly buffer InB  { vec4  inB[]; };\n";
+        oss << "layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };\n";
+        oss << "layout(push_constant) uniform Params {\n"
+            << "  uint count;\n"
+            << "  vec4 row0; vec4 row1; vec4 row2; vec4 row3;\n"
+            << "  vec4 bias; vec4 scale; vec4 sbbias;\n"
+            << "} pc;\n";
+
+        oss << "void main() {\n"
+            << "  uint i = gl_GlobalInvocationID.x;\n"
+            << "  if (i >= pc.count) return;\n"
+            << "  vec4 a = inA[i];\n"
+            << "  vec4 m = vec4(dot(pc.row0,a)+pc.bias.x, dot(pc.row1,a)+pc.bias.y,\n"
+            << "                 dot(pc.row2,a)+pc.bias.z, dot(pc.row3,a)+pc.bias.w);\n"
+            << "  vec4 s = m * pc.scale + pc.sbbias;\n"
+            << "  vec4 b = inB[i];\n"
+            << "  outData[i] = dot(s, b);\n"
+            << "}\n";
+    }
+    else if (prog.name == "matvec_f32") {
+        if (spec.use_tiling) {
+            oss << "layout(set=0,binding=0,std430) readonly buffer Mat  { float matA[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer Vec  { float vecB[]; };\n";
+            oss << "layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };\n";
+            oss << "layout(push_constant) uniform Params { uint count; uint width; } pc;\n";
+            oss << "#define TILE_K " << spec.tile_size << "\n";
+            oss << "shared float s_vec[TILE_K];\n";
+            oss << "void main() {\n"
+                << "  uint i = gl_GlobalInvocationID.x;\n"
+                << "  if (i >= pc.count) return;\n"
+                << "  float acc = 0.0;\n"
+                << "  uint k = pc.width;\n"
+                << "  for (uint base = 0; base < k; base += TILE_K) {\n"
+                << "    uint offset = base + (gl_LocalInvocationID.x % TILE_K);\n"
+                << "    if (offset < k) s_vec[gl_LocalInvocationID.x % TILE_K] = vecB[offset];\n"
+                << "    barrier();\n"
+                << "    uint limit = min(TILE_K, k - base);\n"
+                << "    for (uint j = 0; j < limit; j++)\n"
+                << "      acc += matA[i * k + base + j] * s_vec[j];\n"
+                << "    barrier();\n"
+                << "  }\n"
+                << "  outData[i] = acc;\n"
+                << "}\n";
+        } else {
+            oss << "layout(set=0,binding=0,std430) readonly buffer Mat  { float matA[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer Vec  { float vecB[]; };\n";
+            oss << "layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };\n";
+            oss << "layout(push_constant) uniform Params { uint count; uint width; } pc;\n";
+            oss << "void main() {\n"
+                << "  uint i = gl_GlobalInvocationID.x;\n"
+                << "  if (i >= pc.count) return;\n"
+                << "  float acc = 0.0;\n"
+                << "  for (uint j = 0; j < pc.width; j++)\n"
+                << "    acc += matA[i * pc.width + j] * vecB[j];\n"
+                << "  outData[i] = acc;\n"
+                << "}\n";
+        }
+    }
+    else if (prog.name == "matvec_q8") {
+        if (spec.use_tiling) {
+            oss << "layout(set=0,binding=0,std430) readonly buffer MatW  { uvec4 matW[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer VecX  { uvec4 vecX[]; };\n";
+            oss << "layout(set=0,binding=2,std430) readonly buffer Scale { float scales[]; };\n";
+            oss << "layout(set=0,binding=3,std430) writeonly buffer Out   { float outData[]; };\n";
+            oss << "layout(push_constant) uniform Params { uint count; uint width; } pc;\n";
+            oss << "#define TILE_K " << spec.tile_size << "\n";
+            oss << "shared int s_vec[TILE_K];\n";
+            oss << "int unpack_i8(uvec4 v, uint lane) {\n"
+                << "  int val = int(v[lane] & 0xFFu);\n"
+                << "  if (val >= 128) val -= 256;\n"
+                << "  return val;\n"
+                << "}\n";
+            oss << "void main() {\n"
+                << "  uint i = gl_GlobalInvocationID.x;\n"
+                << "  if (i >= pc.count) return;\n"
+                << "  int acc = 0;\n"
+                << "  uint k = pc.width;\n"
+                << "  uint kv4 = (k + 3u) / 4u;\n"
+                << "  for (uint base = 0; base < k; base += TILE_K) {\n"
+                << "    for (uint t = 0; t < TILE_K; t++) {\n"
+                << "      uint gid = gl_LocalInvocationID.x;\n"
+                << "      if (t == gid % TILE_K && base + t < k) {\n"
+                << "        uint cg = (base + t) / 4u; uint lane = (base + t) % 4u;\n"
+                << "        s_vec[t] = unpack_i8(vecX[cg], lane);\n"
+                << "      }\n"
+                << "    }\n"
+                << "    barrier();\n"
+                << "    uint limit = min(TILE_K, k - base);\n"
+                << "    for (uint j = 0; j < limit; j++) {\n"
+                << "      uint cg = (base + j) / 4u; uint lane = (base + j) % 4u;\n"
+                << "      int w = unpack_i8(matW[i * kv4 + cg], lane);\n"
+                << "      int x = s_vec[j];\n"
+                << "      acc += w * x;\n"
+                << "    }\n"
+                << "    barrier();\n"
+                << "  }\n"
+                << "  outData[i] = float(acc) * scales[i];\n"
+                << "}\n";
+        } else {
+            oss << "layout(set=0,binding=0,std430) readonly buffer MatW  { uvec4 matW[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer VecX  { uvec4 vecX[]; };\n";
+            oss << "layout(set=0,binding=2,std430) readonly buffer Scale { float scales[]; };\n";
+            oss << "layout(set=0,binding=3,std430) writeonly buffer Out   { float outData[]; };\n";
+            oss << "layout(push_constant) uniform Params { uint count; uint width; } pc;\n";
+            oss << "int unpack_i8(uvec4 v, uint lane) {\n"
+                << "  int val = int(v[lane] & 0xFFu);\n"
+                << "  if (val >= 128) val -= 256;\n"
+                << "  return val;\n"
+                << "}\n";
+            oss << "void main() {\n"
+                << "  uint i = gl_GlobalInvocationID.x;\n"
+                << "  if (i >= pc.count) return;\n"
+                << "  int acc = 0;\n"
+                << "  uint k = pc.width;\n"
+                << "  uint kv4 = (k + 3u) / 4u;\n"
+                << "  for (uint j = 0; j < k; j++) {\n"
+                << "    uint cg = j / 4u; uint lane = j % 4u;\n"
+                << "    int w = unpack_i8(matW[i * kv4 + cg], lane);\n"
+                << "    int x = unpack_i8(vecX[cg], lane);\n"
+                << "    acc += w * x;\n"
+                << "  }\n"
+                << "  outData[i] = float(acc) * scales[i];\n"
+                << "}\n";
+        }
+    }
+    else {
+        // Generic fallback - not implemented
+        return "// unsupported workload";
+    }
+
+    return oss.str();
+}
+
+std::string GLSLGenerator::generate_unfused_stage(const Program& prog, size_t stage_idx,
+                                                   const ShaderSpec& spec) {
+    // For unfused mode, each stage is a separate shader
+    // Stage 0: first operation, Stage 1: second operation, etc.
+    // Each stage reads from previous output buffer
+
+    std::ostringstream oss;
+    oss << "#version 450\n";
+    oss << "// V12-VPU unfused stage " << stage_idx << "\n";
+
+    if (prog.name == "transform_scale_dot") {
+        const auto& stages = std::vector<std::string>{"mat4", "scale", "dot"};
+        if (stage_idx >= stages.size()) return "// invalid stage";
+
+        oss << "layout(local_size_x = 64) in;\n";
+        if (stages[stage_idx] == "mat4") {
+            oss << "layout(set=0,binding=0,std430) readonly buffer InA { vec4 inA[]; };\n";
+            oss << "layout(set=0,binding=1,std430) writeonly buffer Scr { vec4 scratch1[]; };\n";
+            oss << "layout(push_constant) uniform P { uint count; vec4 r0; vec4 r1; vec4 r2; vec4 r3; vec4 bias; } pc;\n";
+            oss << "void main() { uint i=gl_GlobalInvocationID.x; if(i>=pc.count) return;\n";
+            oss << "  vec4 a=inA[i];\n";
+            oss << "  scratch1[i]=vec4(dot(pc.r0,a)+pc.bias.x,dot(pc.r1,a)+pc.bias.y,\n";
+            oss << "                   dot(pc.r2,a)+pc.bias.z,dot(pc.r3,a)+pc.bias.w); }\n";
+        } else if (stages[stage_idx] == "scale") {
+            oss << "layout(set=0,binding=0,std430) readonly buffer Scr1 { vec4 scratch1[]; };\n";
+            oss << "layout(set=0,binding=1,std430) writeonly buffer Scr2 { vec4 scratch2[]; };\n";
+            oss << "layout(push_constant) uniform P { uint count; vec4 scale; vec4 bias; } pc;\n";
+            oss << "void main() { uint i=gl_GlobalInvocationID.x; if(i>=pc.count) return;\n";
+            oss << "  scratch2[i]=scratch1[i]*pc.scale+pc.bias; }\n";
+        } else {
+            oss << "layout(set=0,binding=0,std430) readonly buffer Scr2 { vec4 scratch2[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer InB { vec4 inB[]; };\n";
+            oss << "layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };\n";
+            oss << "layout(push_constant) uniform P { uint count; } pc;\n";
+            oss << "void main() { uint i=gl_GlobalInvocationID.x; if(i>=pc.count) return;\n";
+            oss << "  outData[i]=dot(scratch2[i], inB[i]); }\n";
+        }
+    }
+    else if (prog.name == "matvec_f32") {
+        if (stage_idx == 0) {
+            oss << "layout(local_size_x = 64) in;\n";
+            oss << "layout(set=0,binding=0,std430) readonly buffer Mat { float matA[]; };\n";
+            oss << "layout(set=0,binding=1,std430) writeonly buffer Scr { float scratch[]; };\n";
+            oss << "layout(push_constant) uniform P { uint count; uint width; } pc;\n";
+            oss << "void main() { uint i=gl_GlobalInvocationID.x; if(i>=pc.count) return;\n";
+            oss << "  uint base=i*pc.width; for(uint j=0;j<pc.width;j++)\n";
+            oss << "    scratch[base+j]=matA[base+j]; }\n";
+        } else {
+            oss << "layout(local_size_x = 64) in;\n";
+            oss << "layout(set=0,binding=0,std430) readonly buffer Scr { float scratch[]; };\n";
+            oss << "layout(set=0,binding=1,std430) readonly buffer Vec  { float vecB[]; };\n";
+            oss << "layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };\n";
+            oss << "layout(push_constant) uniform P { uint count; uint width; } pc;\n";
+            oss << "void main() { uint i=gl_GlobalInvocationID.x; if(i>=pc.count) return;\n";
+            oss << "  uint base=i*pc.width; float acc=0.0;\n";
+            oss << "  for(uint j=0;j<pc.width;j++) acc+=scratch[base+j]*vecB[j];\n";
+            oss << "  outData[i]=acc; }\n";
+        }
+    }
+    else {
+        return "// unsupported workload for unfused";
+    }
+
+    return oss.str();
+}
+
+// ── SPIR-V compiler (calls glslc) ─────────────────────────────────────────────
+
+SPIRVCompiler::Result SPIRVCompiler::compile_glsl(const std::string& glsl_source,
+                                                   const std::string& /*entry*/) {
+    // Write GLSL to temp file
+    std::string tmp_glsl = "/tmp/_tmp_shader.comp";
+    std::string tmp_spv  = "/tmp/_tmp_shader.spv";
+    std::ofstream glsl_f(tmp_glsl);
+    glsl_f << glsl_source;
+    glsl_f.close();
+
+    Result result;
+    if (!compile_file(tmp_glsl, tmp_spv, &result.error)) {
+        result.ok = false;
+        return result;
+    }
+
+    std::ifstream spv_f(tmp_spv, std::ios::binary);
+    if (!spv_f) {
+        result.ok = false;
+        result.error = "failed to open temp SPIR-V";
+        return result;
+    }
+    spv_f.unsetf(std::ios::skipws);
+    spv_f.seekg(0, std::ios::end);
+    size_t size = spv_f.tellp();
+    spv_f.seekg(0, std::ios::beg);
+    result.spirv.resize(size / 4);
+    spv_f.read(reinterpret_cast<char*>(result.spirv.data()), size);
+    result.ok = true;
+    return result;
+}
+
+bool SPIRVCompiler::compile_file(const std::string& glsl_path,
+                                  const std::string& spv_path,
+                                  std::string* error) {
+    std::string cmd = "glslc -fshader-stage=compute \"" + glsl_path + "\" -o \"" + spv_path + "\"";
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) {
+        if (error) *error = "glslc failed with code " + std::to_string(ret);
+        return false;
+    }
+    return std::filesystem::exists(spv_path);
+}
+
+// ── Full compiler pipeline ───────────────────────────────────────────────────
+
+Compiler::Output Compiler::compile(const Program& prog, const ShaderSpec& spec) {
+    Output out;
+
+    // Validate
+    auto vr = Validator::validate(prog);
+    if (!vr.ok) {
+        out.errors.push_back("validation: " + vr.error);
+        return out;
+    }
+
+    // Optimize
+    Optimizer::Stats stats;
+    Program opt_prog = Optimizer::optimize(prog, &stats);
+
+    // Generate GLSL
+    ShaderSpec fused_spec = spec;
+    fused_spec.use_tiling = spec.autotune || spec.use_tiling;
+    out.glsl_fused = GLSLGenerator::generate(opt_prog, fused_spec);
+
+    // Compile to SPIR-V
+    auto spirv_result = SPIRVCompiler::compile_glsl(out.glsl_fused);
+    if (!spirv_result.ok) {
+        out.errors.push_back("spirv compile: " + spirv_result.error);
+    } else {
+        out.spirv_fused = std::move(spirv_result.spirv);
+    }
+
+    // Generate unfused stages
+    auto plan = FusionAnalyzer::analyze(prog);
+    size_t n_stages = 1;
+    if (prog.name == "transform_scale_dot") n_stages = 3;
+    else if (prog.name == "matvec_f32")      n_stages = 2;
+
+    for (size_t s = 0; s < n_stages; s++) {
+        std::string stage_glsl = GLSLGenerator::generate_unfused_stage(opt_prog, s, spec);
+        out.glsl_unfused.push_back(stage_glsl);
+        auto sr = SPIRVCompiler::compile_glsl(stage_glsl);
+        if (sr.ok) out.spirv_unfused.push_back(std::move(sr.spirv));
+        else out.errors.push_back("unfused stage " + std::to_string(s) + ": " + sr.error);
+    }
+
+    // Generate tile-size variants for autotuning
+    if (spec.autotune) {
+        for (u32 ts : {16, 32, 64, 128, 256}) {
+            ShaderSpec ts_spec = spec;
+            ts_spec.tile_size = ts;
+            ts_spec.use_tiling = true;
+            out.tile_variants.push_back(GLSLGenerator::generate(opt_prog, ts_spec));
+        }
+    }
+
+    return out;
+}
+
+} // namespace v12

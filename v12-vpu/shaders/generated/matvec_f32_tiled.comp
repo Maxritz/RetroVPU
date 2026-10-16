@@ -1,0 +1,20 @@
+#version 450
+// V12-VPU generated: tiled float32 matrix-vector multiply (loop unrolled over vector chunks)
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+#define TILE_K 32
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float acc = 0.0;
+    uint k = pc.width;
+    for (uint j = 0; j < k; j += TILE_K) {
+        uint limit = min(TILE_K, k - j);
+        for (uint t = 0; t < limit; t++)
+            acc += matA[i * k + j + t] * vecB[j + t];
+    }
+    outData[i] = acc;
+}

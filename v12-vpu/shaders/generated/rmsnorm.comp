@@ -1,0 +1,58 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_debug_printf : enable
+// rmsnorm.comp - RMSNorm, one row per workgroup.
+// V12.QUEUE: parallel (subgroup-first) reduction over the serial version.
+// Paper: 2508.06753 III-B (SLM parallel reduction); TokenWeave fused reduction.
+// Phi-3 (GGUF phi3.*): eps=1e-5, count=3072. Device: subgroup=32, SMEM=48KB.
+layout(local_size_x = 64) in;  // 2 subgroups of 32 lanes
+layout(set=0, binding=0, std430) readonly  buffer InBuf  { float indata[]; };
+layout(set=0, binding=1, std430) readonly  buffer WtBuf  { float weight[]; };
+layout(set=0, binding=2, std430) writeonly buffer OutBuf { float outdata[]; };
+#include "pc.h"
+// pc.count = feature_dim (3072 for Phi-3)
+
+const float RMS_EPS = 1.0e-5;  // GGUF phi3.attention.layer_norm_rms_epsilon
+const uint  NSG     = 2u;      // local_size_x / subgroup_size (64 / 32)
+
+shared float s_part[NSG];
+shared float s_norm;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint base = row * pc.count;
+
+    float acc = 0.0;
+    for (uint i = tid; i < pc.count; i += 64u) {
+        float v = indata[base + i];
+        acc = fma(v, v, acc);
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        s_part[gl_SubgroupID] = acc;
+        debugPrintfEXT("[rmsnorm::subgroup_shuffle] wg=%u sg=%u part=%f\n",
+                       row, gl_SubgroupID, acc);
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < NSG; ++s) total += s_part[s];
+        float mean_sq = total / float(pc.count);
+        s_norm = 1.0 / sqrt(mean_sq + RMS_EPS);
+        debugPrintfEXT("[rmsnorm::parallel_reduce] wg=%u cnt=%u msq=%f nrm=%f\n",
+                       row, pc.count, mean_sq, s_norm);
+    }
+    barrier();
+
+    float nf = s_norm;
+    for (uint i = tid; i < pc.count; i += 64u) {
+        outdata[base + i] = indata[base + i] * nf * weight[i];
+    }
+
+    // Debug tag: [rmsnorm::complete]
+    if (tid == 0u) debugPrintfEXT("[rmsnorm::complete] wg=%u\n", row);
+}

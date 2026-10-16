@@ -1,0 +1,17 @@
+#version 450
+// V12-VPU generated: fused float32 matrix-vector multiply
+// IR: LOAD row; LOAD vec; DOT_F32; STORE
+layout(local_size_x = 64) in;
+layout(set=0,binding=0,std430) readonly buffer Mat  { float matA[]; };
+layout(set=0,binding=1,std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0,binding=2,std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float acc = 0.0;
+    for (uint j = 0; j < pc.width; j++) {
+        acc += matA[i * pc.width + j] * vecB[j];
+    }
+    outData[i] = acc;
+}

@@ -1,0 +1,70 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_debug_printf : enable
+// softmax.comp - causal-masked softmax, one row per workgroup.
+// V12.P4: fuse data movement + elementwise (exp/subtract/divide in one pass).
+// Paper: 2508.06753 III-E (fused epilogue); FlashAttention-4; SOLE (exp).
+// Phi-3: pc.count = row length (seq_len), pc.in_w = current position (causal limit).
+layout(local_size_x = 256) in;  // 8 subgroups of 32 lanes
+layout(set=0, binding=0, std430) readonly buffer Scores { float scores[]; };
+layout(set=0, binding=1, std430) buffer Output { float outbuf[]; };
+#include "pc.h"
+
+const uint  NSG      = 8u;             // local_size_x / subgroup_size (256 / 32)
+const float NEG_INF  = -3.402823466e38;
+
+shared float s_part[NSG];  // SLM reduction buffer
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint base = row * pc.count;
+    uint limit = min(pc.in_w, pc.count - 1u);  // causal: attend to 0..limit
+
+    // --- pass 1: row max over the causal window ---
+    float lmax = NEG_INF;
+    for (uint i = tid; i <= limit; i += 256u) {
+        lmax = max(lmax, scores[base + i]);
+    }
+    lmax = subgroupMax(lmax);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lmax;
+    barrier();
+    if (tid == 0u) {
+        float m = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) m = max(m, s_part[s]);
+        s_part[0] = m;
+        debugPrintfEXT("[softmax::slm_reduction] row=%u max=%f\n", row, m);
+    }
+    barrier();
+    float row_max = s_part[0];
+
+    // --- pass 2: fused epilogue, exp(x-max) stored + summed in one sweep ---
+    float lsum = 0.0;
+    for (uint i = tid; i <= limit; i += 256u) {
+        float val = exp(scores[base + i] - row_max);  // [softmax::fused_epilogue]
+        outbuf[base + i] = val;
+        lsum += val;
+    }
+    lsum = subgroupAdd(lsum);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lsum;
+    barrier();
+    if (tid == 0u) {
+        float t = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) t += s_part[s];
+        s_part[0] = 1.0 / t;
+    }
+    barrier();
+    float inv = s_part[0];
+
+    // --- pass 3: normalize; zero the masked tail ---
+    for (uint i = tid; i <= limit; i += 256u) {
+        outbuf[base + i] = outbuf[base + i] * inv;
+    }
+    for (uint i = limit + 1u + tid; i < pc.count; i += 256u) {
+        outbuf[base + i] = 0.0;
+    }
+
+    // Debug tag: [softmax::complete]
+    if (tid == 0u) debugPrintfEXT("[softmax::complete] row=%u n=%u\n", row, pc.count);
+}

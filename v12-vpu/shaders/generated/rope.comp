@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_debug_printf : enable
+// rope.comp - Rotary Position Embedding, applied in place to Q and K.
+// V12.FUSE: single load/rotate/store pass, coalesced over (head, pair).
+// Layout: split-half (GPT-NeoX), matching HF Phi3 rotate_half and
+//         llama.cpp GGML_ROPE_TYPE_NEOX:
+//   out[.., :h] = x1*cos - x2*sin ;  out[.., h:] = x2*cos + x1*sin
+// Phi-3 GGUF: rotary_dim=96 (full head_dim), theta_base=10000.
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) buffer Q { float q[]; };
+layout(set=0, binding=1, std430) buffer K { float k[]; };
+#include "pc.h"
+// pc.count = rotary_dim (96)
+// pc.width = seq_pos
+// pc.in_w  = num_heads * head_dim per token (3072)
+// pc.in_h  = head_dim (96)
+
+const float THETA_BASE = 10000.0;
+
+void main() {
+    uint dim   = pc.count;          // rotary_dim
+    uint hdim  = pc.in_h;           // head_dim
+    uint nhead = pc.in_w / hdim;    // heads per token
+    uint rh    = dim / 2u;          // split-half width (rotary_dim/2)
+    float pos  = float(pc.width);
+
+    uint per_token = nhead * rh;    // (head, pair) work items per token
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    for (uint idx = gl_GlobalInvocationID.x; idx < per_token; idx += stride) {
+        uint token = idx / per_token;          // 0 for the single-token driver
+        uint rem   = idx % per_token;
+        uint h     = rem / rh;
+        uint i     = rem % rh;
+
+        float freq  = pow(THETA_BASE, -2.0 * float(i) / float(dim));
+        float angle = pos * freq;
+        float c = cos(angle), s = sin(angle);
+
+        uint base = token * pc.in_w + h * hdim;
+        // Debug tag: [rope::inplace_rotation]
+        float q1 = q[base + i],      q2 = q[base + i + rh];
+        float k1 = k[base + i],      k2 = k[base + i + rh];
+        q[base + i]      = q1 * c - q2 * s;
+        q[base + i + rh] = q2 * c + q1 * s;
+        k[base + i]      = k1 * c - k2 * s;
+        k[base + i + rh] = k2 * c + k1 * s;
+    }
+
+    // Debug tag: [rope::theta_scaling]
+    if (gl_GlobalInvocationID.x == 0u)
+        debugPrintfEXT("[rope::theta_scaling] theta=%f pos=%f pairs=%u\n",
+                       THETA_BASE, pos, per_token);
+    // Debug tag: [rope::complete]
+    if (gl_GlobalInvocationID.x == 0u)
+        debugPrintfEXT("[rope::complete] nhead=%u dim=%u\n", nhead, dim);
+}

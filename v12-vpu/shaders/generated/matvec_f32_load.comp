@@ -1,0 +1,18 @@
+#version 450
+// Direct Vulkan, unfused matvec_f32 stage 1: partial dot product (first half)
+// Binding 0=matA(in), 1=vecB(in), 2=scratch(out partial sums)
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Scr { float scratch[]; };
+#include "pc.h"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    uint base = i * pc.width;
+    float acc = 0.0;
+    uint half_k = pc.width / 2u;
+    for (uint j = 0; j < half_k; j++)
+        acc += matA[base + j] * vecB[j];
+    scratch[i] = acc;
+}

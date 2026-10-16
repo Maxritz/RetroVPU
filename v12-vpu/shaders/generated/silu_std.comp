@@ -1,0 +1,27 @@
+#version 450
+#include "pc.h"
+// silu_std.comp - standard fused SiLU(gate)*up epilogue (baseline twin of silu_exp2.comp).
+// Uses GLSL `exp` (the standard path).
+// Provenance (AGENTS.md): clean-room. SiLU math follows the public GGUF/ggml reference
+// (SwiGLU). Intel Xe-Forge knowledge_base guidance cites exp2 as an XPU fast path, but
+// this file intentionally uses `exp` so the two are a fair R5/R6 comparison.
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly  buffer GateBuf { float gate[]; };
+layout(set=0, binding=1, std430) readonly  buffer UpBuf   { float up[]; };
+layout(set=0, binding=2, std430) writeonly buffer MidBuf  { float mid[]; };
+
+float sigmoid_stable(float x) {
+    float e = exp(-abs(x));
+    float s = e / (1.0 + e);          // = sigmoid(-|x|)
+    return (x >= 0.0) ? (1.0 - s) : s;
+}
+
+void main() {
+    uint total = pc.count;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        float g = gate[i];
+        float silu = g * sigmoid_stable(g);
+        mid[i] = silu * up[i];
+    }
+}

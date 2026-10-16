@@ -1,0 +1,60 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// softmax_std.comp - standard softmax epilogue, one row per workgroup.
+// Baseline counterpart to softmax_exp2.comp. Uses GLSL `exp` (the standard path).
+// Provenance (AGENTS.md): clean-room. Softmax math follows the public GGUF/ggml
+// reference; Intel Xe-Forge knowledge_base guidance cites exp2 as an XPU fast path,
+// but this file intentionally uses `exp` so the two are a fair R5/R6 comparison.
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly buffer Scores { float scores[]; };
+layout(set=0, binding=1, std430) buffer Output { float outbuf[]; };
+#include "pc.h"
+
+const uint  NSG      = 8u;             // local_size_x / subgroup_size (256 / 32)
+const float NEG_INF  = -3.402823466e38;
+shared float s_part[NSG];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint base = row * pc.count;
+    uint limit = min(pc.in_w, pc.count - 1u);
+
+    float lmax = NEG_INF;
+    for (uint i = tid; i <= limit; i += 256u)
+        lmax = max(lmax, scores[base + i]);
+    lmax = subgroupMax(lmax);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lmax;
+    barrier();
+    if (tid == 0u) {
+        float m = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) m = max(m, s_part[s]);
+        s_part[0] = m;
+    }
+    barrier();
+    float row_max = s_part[0];
+
+    // Pass 2: standard exp(x-max) epilogue fused with the sum.
+    float lsum = 0.0;
+    for (uint i = tid; i <= limit; i += 256u) {
+        float val = exp(scores[base + i] - row_max);
+        outbuf[base + i] = val;
+        lsum += val;
+    }
+    lsum = subgroupAdd(lsum);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lsum;
+    barrier();
+    if (tid == 0u) {
+        float t = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) t += s_part[s];
+        s_part[0] = 1.0 / t;
+    }
+    barrier();
+    float inv = s_part[0];
+
+    for (uint i = tid; i <= limit; i += 256u)
+        outbuf[base + i] = outbuf[base + i] * inv;
+    for (uint i = limit + 1u + tid; i < pc.count; i += 256u)
+        outbuf[base + i] = 0.0;
+}

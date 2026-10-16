@@ -1,0 +1,59 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_debug_printf : enable
+// fused_qkv.comp - fused QKV projection: q,k,v = W[proj] @ x.  (V12.FUSE: x loaded once)
+// V12.ELIDE + ComFuse B2BGEMM: one workgroup per output row; the row's weights
+// are read fully coalesced as vec4 (thread tid walks weights4[row*dim/4 + tid]).
+// Paper: 2508.06753 III-E. Weight layout: [Q(rows);K(rows);V(rows)] row-major.
+layout(local_size_x = 256) in;  // 8 subgroups of 32 lanes
+layout(set=0, binding=0, std430) readonly  buffer InBuf { vec4 inbuf[]; };
+layout(set=0, binding=1, std430) readonly  buffer WtBuf { vec4 weights[]; };
+layout(set=0, binding=2, std430) writeonly buffer QBuf  { float q_out[]; };
+layout(set=0, binding=3, std430) writeonly buffer KBuf  { float k_out[]; };
+layout(set=0, binding=4, std430) writeonly buffer VBuf  { float v_out[]; };
+#include "pc.h"
+// pc.count = input dim (hidden = 3072, must be a multiple of 4)
+// pc.width = output rows per projection (hidden = 3072)
+
+const uint NSG = 8u;  // local_size_x / subgroup_size (256 / 32)
+shared float s_part[NSG];  // Debug tag: [fused_qkv::smem_tile]
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.count;
+    uint dim4 = dim >> 2u;       // vec4 count per row
+    uint rows = pc.width;
+
+    uint g = gl_WorkGroupID.x;   // output row in [0, 3*rows): Q|K|V contiguous
+    uint proj = g / rows;        // 0=Q 1=K 2=V
+    uint m    = g - proj * rows; // row within projection
+    uint wbase = g * dim4;       // vec4 offset of this row
+
+    float acc = 0.0;
+    for (uint k = tid; k < dim4; k += 256u) {
+        vec4 w = weights[wbase + k];
+        vec4 x = inbuf[k];
+        acc = fma(x.x, w.x, acc);
+        acc = fma(x.y, w.y, acc);
+        acc = fma(x.z, w.z, acc);
+        acc = fma(x.w, w.w, acc);
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+
+    if (tid == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < NSG; ++s) t += s_part[s];
+        // Debug tag: [fused_qkv::fused_epilogue]
+        if (proj == 0u)      q_out[m] = t;
+        else if (proj == 1u) k_out[m] = t;
+        else                 v_out[m] = t;
+    }
+
+    // Debug tag: [fused_qkv::complete]
+    if (g == 0u && tid == 0u)
+        debugPrintfEXT("[fused_qkv::complete] dim=%u rows=%u\n", dim, rows);
+}

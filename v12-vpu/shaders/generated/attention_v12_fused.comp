@@ -1,0 +1,22 @@
+#version 450
+// V12-VPU attention: fused tiled score computation
+// One row per workgroup. Fused: load + dot in single pass (no shared memory, no barrier).
+// 1D workgroup (64 threads) routes to async compute engines.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Hidden { float hidden[]; };
+layout(set=0, binding=1, std430) writeonly buffer Scores { float outData[]; };
+#include "pc.h"
+#define HEAD_DIM 64
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+    uint k = pc.count;
+    if (wid >= k) return;
+    // Each thread computes columns tid, tid+64, ...
+    for (uint c = tid; c < k; c += 64u) {
+        float acc = 0.0;
+        for (uint d = 0u; d < HEAD_DIM; d++)
+            acc += hidden[wid * HEAD_DIM + d] * hidden[c * HEAD_DIM + d];
+        outData[wid * k + c] = acc / sqrt(float(HEAD_DIM));
+    }
+}

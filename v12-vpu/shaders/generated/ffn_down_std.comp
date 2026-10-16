@@ -1,0 +1,37 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// ffn_down_std.comp - standard (unfused) ffn_down matvec, same V12 organization as the
+// fused twin so the ONLY variable is the fusion (R2). Reads a PRE-MATERIALIZED mid[]
+// (produced by a separate silu_mul dispatch); that extra read+write of [interm] is the
+// cost ComFuse/DeepFusionKernel (arXiv:2602.11808) fuse away.
+// Provenance (AGENTS.md): clean-room.
+layout(local_size_x = 128) in;
+layout(set=0, binding=0, std430) readonly  buffer Mid   { float mid[]; };
+layout(set=0, binding=1, std430) readonly  buffer Wgt   { float w[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out   { float outv[]; };
+#include "pc.h"
+
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+const uint NSG = LOCAL_X / 32u;
+shared float s_part[NSG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint K = pc.width;
+    float acc = 0.0;
+    for (uint i = lane; i < K; i += LOCAL_X)
+        acc += mid[i] * w[row * K + i];
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < NSG; ++s) t += s_part[s];
+        outv[row] = t;
+    }
+}

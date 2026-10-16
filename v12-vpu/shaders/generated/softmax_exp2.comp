@@ -1,0 +1,64 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// softmax_exp2.comp - V12 + Intel exp2 guidance for the epilogue exp.
+// Applies the Xe-Forge knowledge_base guidance: on Intel XPU, exp2 maps to a
+// native hardware fast-path, so exp(x) is rewritten exp2(x / ln(2)). This is an
+// independent, switchable ablation (R9): softmax_std.comp is the std `exp` twin.
+// Provenance (AGENTS.md): clean-room. Softmax math follows the public GGUF/ggml
+// reference; the exp->exp2 rewrite is the documented Intel XPU guidance
+// (knowledge_base/triton/xpu/xpu_optimizations.yaml: sigmoid_via_exp2,
+// xpu_exp2_attention_scaling).
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly buffer Scores { float scores[]; };
+layout(set=0, binding=1, std430) buffer Output { float outbuf[]; };
+#include "pc.h"
+
+const uint  NSG      = 8u;
+const float NEG_INF  = -3.402823466e38;
+const float INV_LN2  = 1.4426950408889634;   // 1 / ln(2)
+shared float s_part[NSG];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint base = row * pc.count;
+    uint limit = min(pc.in_w, pc.count - 1u);
+
+    float lmax = NEG_INF;
+    for (uint i = tid; i <= limit; i += 256u)
+        lmax = max(lmax, scores[base + i]);
+    lmax = subgroupMax(lmax);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lmax;
+    barrier();
+    if (tid == 0u) {
+        float m = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) m = max(m, s_part[s]);
+        s_part[0] = m;
+    }
+    barrier();
+    float row_max = s_part[0];
+
+    // Pass 2: INTEL exp2 fast-path. exp(d) == exp2(d * INV_LN2).
+    float lsum = 0.0;
+    for (uint i = tid; i <= limit; i += 256u) {
+        float val = exp2((scores[base + i] - row_max) * INV_LN2);
+        outbuf[base + i] = val;
+        lsum += val;
+    }
+    lsum = subgroupAdd(lsum);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = lsum;
+    barrier();
+    if (tid == 0u) {
+        float t = s_part[0];
+        for (uint s = 1u; s < NSG; ++s) t += s_part[s];
+        s_part[0] = 1.0 / t;
+    }
+    barrier();
+    float inv = s_part[0];
+
+    for (uint i = tid; i <= limit; i += 256u)
+        outbuf[base + i] = outbuf[base + i] * inv;
+    for (uint i = limit + 1u + tid; i < pc.count; i += 256u)
+        outbuf[base + i] = 0.0;
+}

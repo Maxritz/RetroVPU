@@ -1,0 +1,24 @@
+#version 450
+// Path 2: Direct Vulkan, tiled quantised int8 matrix-vector multiply (cache-friendly loop)
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer MatW  { uint matW[]; };
+layout(set=0, binding=1, std430) readonly buffer VecX  { uint vecX[]; };
+layout(set=0, binding=2, std430) readonly buffer Scale { float scales[]; };
+layout(set=0, binding=3, std430) writeonly buffer Out   { float outData[]; };
+#include "pc.h"
+int unpack_i8(uint word, uint lane) {
+    int val = int((word >> (lane * 8u)) & 0xFFu);
+    if (val >= 128) val -= 256;
+    return val;
+}
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    int acc = 0; uint k = pc.width; uint kv4 = (k + 3u) / 4u;
+    for (uint j = 0; j < k; j++) {
+        int w = unpack_i8(matW[i * kv4 + j / 4u], j % 4u);
+        int x = unpack_i8(vecX[j / 4u], j % 4u);
+        acc += w * x;
+    }
+    outData[i] = float(acc) * scales[i];
+}

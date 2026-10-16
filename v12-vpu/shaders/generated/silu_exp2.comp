@@ -1,0 +1,31 @@
+#version 450
+#include "pc.h"
+// silu_exp2.comp - V12 + Intel exp2 guidance for the sigmoid.
+// Applies Xe-Forge knowledge_base guidance: on Intel XPU, exp2 maps to a native
+// hardware fast-path, so exp(-|x|) is rewritten exp2(-|x| / ln(2)). Independent,
+// switchable ablation (R9): silu_std.comp is the std `exp` twin.
+// Provenance (AGENTS.md): clean-room. SiLU math follows the public GGUF/ggml reference
+// (SwiGLU); the exp->exp2 rewrite is the documented Intel XPU guidance
+// (knowledge_base/triton/xpu/xpu_optimizations.yaml: sigmoid_via_exp2).
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly  buffer GateBuf { float gate[]; };
+layout(set=0, binding=1, std430) readonly  buffer UpBuf   { float up[]; };
+layout(set=0, binding=2, std430) writeonly buffer MidBuf  { float mid[]; };
+
+const float INV_LN2 = 1.4426950408889634;   // 1 / ln(2)
+
+float sigmoid_exp2(float x) {
+    float e = exp2(-abs(x) * INV_LN2);      // exp(-|x|) := exp2(-|x|/ln2)
+    float s = e / (1.0 + e);
+    return (x >= 0.0) ? (1.0 - s) : s;
+}
+
+void main() {
+    uint total = pc.count;
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        float g = gate[i];
+        float silu = g * sigmoid_exp2(g);
+        mid[i] = silu * up[i];
+    }
+}

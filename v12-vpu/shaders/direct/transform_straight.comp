@@ -1,0 +1,32 @@
+#version 450
+// Path 1: Direct Vulkan, straightforward kernel for V12-inspired transform+scale+dot
+// Hand-written, independent of V12 compiler. No tiling, no shared memory.
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0, std430) readonly buffer InA   { vec4 inA[]; };
+layout(set=0, binding=1, std430) readonly buffer InB   { vec4 inB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out  { float outData[]; };
+
+#include "pc.h"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    vec4 a = inA[i];
+    vec4 b = inB[i];
+
+    // MAT4: row-major 4x4 transform + bias
+    vec4 m = vec4(dot(pc.row0, a) + pc.bias.x,
+                  dot(pc.row1, a) + pc.bias.y,
+                  dot(pc.row2, a) + pc.bias.z,
+                  dot(pc.row3, a) + pc.bias.w);
+
+    // SCALE_BIAS
+    vec4 s = m * pc.scale + pc.sbbias;
+
+    // DOT_F32
+    float d = dot(s, b);
+
+    outData[i] = d;
+}

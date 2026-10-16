@@ -1,0 +1,45 @@
+#version 450
+// Iteration 3: attention with shared-memory hidden loading + bank-conflict-free tile.
+// HipKittens pattern: load tile of key vectors into shared memory,
+// reduce bank conflicts with (HEAD_DIM+1) stride padding.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Hidden { float hidden[]; };
+layout(set=0, binding=1, std430) writeonly buffer Scores { float outData[]; };
+#include "pc.h"
+#define HEAD_DIM 64
+#define WG 64
+#define TILE_COLS 64
+#define STRIDE (HEAD_DIM + 1)  // bank conflict avoidance
+shared float s_hidden[TILE_COLS * STRIDE];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+    uint k = pc.count;
+    if (wid >= k) return;
+
+    float scale = 1.0 / sqrt(float(HEAD_DIM));
+
+    for (uint col_base = 0; col_base < k; col_base += TILE_COLS) {
+        uint col_limit = min(TILE_COLS, k - col_base);
+        uint total = col_limit * HEAD_DIM;
+
+        // Cooperative load key vectors into shared memory with bank-conflict-free stride
+        for (uint t = tid; t < total; t += WG) {
+            uint col = t / HEAD_DIM;
+            uint d   = t % HEAD_DIM;
+            s_hidden[col * STRIDE + d] = hidden[(col_base + col) * HEAD_DIM + d];
+        }
+        barrier();
+
+        // Compute attention scores: query x key for each column in tile
+        for (uint c = tid; c < col_limit; c += WG) {
+            float acc = 0.0;
+            // Load query into registers
+            for (uint d = 0; d < HEAD_DIM; d++)
+                acc += hidden[wid * HEAD_DIM + d] * s_hidden[c * STRIDE + d];
+            outData[wid * k + col_base + c] = acc * scale;
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,57 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+// rmsnorm_matvec_comfuse.comp - ComFuse (arXiv:2608.03537): RMSNorm + matvec fused.
+// WG per row: phase 1 subgroup-reduce nf over indata[row][*]; phase 2 dot of
+//   matA[row][i] * (indata[row][i] * nf * gamma[i])  -- normed[i] is NEVER written to a
+// buffer (the unfused std path rmsnorm.comp => normed[] => matvec_row_sub reads it back).
+// 1 dispatch vs 2 (std). Same per-row math, same WG shape (LOCAL_X=128) as matvec_row_sub.
+// Provenance (AGENTS.md): clean-room, V12 method.
+layout(local_size_x = LOCAL_X) in;
+layout(set=0, binding=0, std430) readonly  buffer InBuf  { float indata[]; };
+layout(set=0, binding=1, std430) readonly  buffer GamBuf { float gamma[]; };
+layout(set=0, binding=2, std430) readonly  buffer WtBuf  { float matA[]; };
+layout(set=0, binding=3, std430) writeonly buffer OutBuf { float outv[]; };
+#include "pc.h"
+const float RMS_EPS = 1.0e-5;
+// Xe-LPG subgroupSize scales with workgroup size (observed 8/16/32); s_part sized to the
+// worst case (min subgroupSize=8) and summed over runtime gl_NumSubgroups so the two
+// subgroup reductions below are correct for ALL LOCAL_X (incl the 1-subgroup edge at LOCAL_X=32).
+shared float s_part[LOCAL_X / 8u];
+shared float s_norm;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint base = row * pc.width;
+    // phase 1: reduce ||indata[row]||^2 -> nf
+    float l2 = 0.0;
+    for (uint i = lane; i < pc.width; i += LOCAL_X)
+        l2 += indata[base + i] * indata[base + i];
+    l2 = subgroupAdd(l2);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = l2;
+    barrier();
+    if (lane == 0u) {
+    float total = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) total += s_part[s];
+        s_norm = 1.0 / sqrt(total / float(pc.width) + RMS_EPS);
+    }
+    barrier();
+    float nf = s_norm;
+    // phase 2: dot matA[row][i] * (indata[row][i] * nf * gamma[i])  -- normed inline, no buffer
+    float acc = 0.0;
+    for (uint i = lane; i < pc.width; i += LOCAL_X)
+        acc += matA[base + i] * (indata[base + i] * nf * gamma[i]);
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+    float t = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) t += s_part[s];
+        outv[row] = t;
+    }
+}

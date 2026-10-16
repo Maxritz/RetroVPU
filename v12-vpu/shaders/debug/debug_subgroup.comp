@@ -1,0 +1,10 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+layout(local_size_x = LOCAL_X) in;
+layout(set=0, binding=0, std430) buffer B { uvec4 info; };
+void main() {
+    if (gl_LocalInvocationID.x == 0u) {
+        info = uvec4(gl_SubgroupSize, gl_NumSubgroups, gl_WorkGroupSize.x, gl_WorkGroupID.x);
+    }
+}

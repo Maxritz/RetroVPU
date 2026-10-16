@@ -1,0 +1,50 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// ffn_down_fused.comp - DeepFusionKernel (arXiv:2602.11808) SwiGLU-MLP fusion.
+// Fuses SiLU(gate)*up with the ffn_down matvec into ONE dispatch, computing the
+// intermediate `mid[i] = silu(gate[i]) * up[i]` on-the-fly inside the row dot so
+// the [interm] intermediate is never written or re-read.
+//   V12 organization (per matvec_gguf_v12): one workgroup per output row; lanes
+//   stride over K (local_size_x=128, 4 subgroups of 32); subgroupAdd + SLM reduce.
+// Only the fusion differs from a non-fused row matvec (R2): same bytes of W read,
+// same grid, same parallelism; the gate/up reads replace the mid[] read+write.
+// Provenance (AGENTS.md): clean-room. SiLU math follows the public GGUF/ggml
+// reference (SwiGLU, Phi-3 MLP); the fusion strategy is DeepFusionKernel (2602.11808).
+layout(local_size_x = 128) in;
+layout(set=0, binding=0, std430) readonly  buffer Gate  { float gate[]; };
+layout(set=0, binding=1, std430) readonly  buffer Up    { float up[]; };
+layout(set=0, binding=2, std430) readonly  buffer Wgt   { float w[]; };
+layout(set=0, binding=3, std430) writeonly buffer Out   { float outv[]; };
+#include "pc.h"
+
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+const uint NSG = LOCAL_X / 32u;
+shared float s_part[NSG];
+
+float sigmoid_stable(float x) {
+    float e = exp(-abs(x));
+    return (x >= 0.0) ? (1.0 - e / (1.0 + e)) : (e / (1.0 + e));
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint K = pc.width;
+    float acc = 0.0;
+    for (uint i = lane; i < K; i += LOCAL_X) {
+        float mid = sigmoid_stable(gate[i]) * gate[i] * up[i];  // silu(gate)*up on the fly
+        acc += mid * w[row * K + i];
+    }
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < NSG; ++s) t += s_part[s];
+        outv[row] = t;
+    }
+}

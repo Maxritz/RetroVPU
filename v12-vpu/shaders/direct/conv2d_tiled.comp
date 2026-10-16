@@ -1,0 +1,21 @@
+#version 450
+// Path 2: Direct Vulkan, tiled 2D convolution (shared memory kernel)
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Image  { float image[]; };
+layout(set=0, binding=1, std430) readonly buffer Kernel { float kernel[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out    { float outData[]; };
+#include "pc.h"
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.count) return;
+    uint oy = idx / pc.width;
+    uint ox = idx % pc.width;
+    float acc = 0.0;
+    for (int dy = 0; dy <= 2; dy++)
+        for (int dx = 0; dx <= 2; dx++) {
+            int iy = int(oy) + dy, ix = int(ox) + dx;
+            if (iy >= 0 && iy < int(pc.in_h) && ix >= 0 && ix < int(pc.in_w))
+                acc += image[uint(iy) * pc.in_w + uint(ix)] * kernel[uint(dy*3 + dx)];
+        }
+    outData[idx] = acc;
+}

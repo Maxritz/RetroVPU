@@ -1,0 +1,56 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// qkv_proj.comp - fusion ablation probe. IDENTICAL body for both modes; the
+// ONLY difference is dispatch count, so any speed delta isolates fusion
+// (weight-read-once + launch consolidation) from intra-row parallelism.
+//   pc.in_w == 0xFFFFFFFF : fused  -> grid=(3*rows), proj = g/rows
+//   pc.in_w == 0/1/2      : split  -> grid=(rows),   proj = pc.in_w, row = g
+// Weight layout [Q(rows);K(rows);V(rows)] row-major, same as fused_qkv.
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly  buffer InBuf { vec4 inbuf[]; };
+layout(set=0, binding=1, std430) readonly  buffer WtBuf { vec4 weights[]; };
+layout(set=0, binding=2, std430) writeonly buffer QBuf  { float q_out[]; };
+layout(set=0, binding=3, std430) writeonly buffer KBuf  { float k_out[]; };
+layout(set=0, binding=4, std430) writeonly buffer VBuf  { float v_out[]; };
+#include "pc.h"
+
+const uint NSG = 8u;
+shared float s_part[NSG];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.count;
+    uint dim4 = dim >> 2u;
+    uint rows = pc.width;
+    uint g = gl_WorkGroupID.x;
+
+    uint proj, grow;
+    if (pc.in_w == 0xFFFFFFFFu) { proj = g / rows; grow = g; }        // fused
+    else                        { proj = pc.in_w;   grow = pc.in_w * rows + g; }  // split
+
+    uint m = grow - proj * rows;
+    uint wbase = grow * dim4;
+
+    float acc = 0.0;
+    for (uint k = tid; k < dim4; k += 256u) {
+        vec4 w = weights[wbase + k];
+        vec4 x = inbuf[k];
+        acc = fma(x.x, w.x, acc);
+        acc = fma(x.y, w.y, acc);
+        acc = fma(x.z, w.z, acc);
+        acc = fma(x.w, w.w, acc);
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+
+    if (tid == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < NSG; ++s) t += s_part[s];
+        if (proj == 0u)      q_out[m] = t;
+        else if (proj == 1u) k_out[m] = t;
+        else                 v_out[m] = t;
+    }
+}

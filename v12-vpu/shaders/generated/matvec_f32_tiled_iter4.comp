@@ -1,0 +1,31 @@
+#version 450
+// Iteration 4: vectorized matvec with float4 loads + subgroup reduction.
+// Uses vec4 array access for 4x bandwidth per load instruction.
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { vec4 matA4[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { vec4 vecB4[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+#define VEC4 4
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float acc = 0.0;
+    uint k = pc.width;
+    uint vec_count = k / VEC4;
+    uint rem = k % VEC4;
+
+    for (uint j = 0; j < vec_count; j++) {
+        vec4 a = matA4[i * vec_count + j];
+        vec4 b = vecB4[j];
+        acc += dot(a, b);
+    }
+    for (uint j = k - rem; j < k; j++) {
+        uint idx_a = (i * k + j) / VEC4;
+        uint comp_a = (i * k + j) % VEC4;
+        uint idx_b = j / VEC4;
+        uint comp_b = j % VEC4;
+        acc += matA4[idx_a][comp_a] * vecB4[idx_b][comp_b];
+    }
+    outData[i] = acc;
+}

@@ -1,0 +1,21 @@
+#version 450
+// Path 1: Direct Vulkan, straightforward float32 matrix-vector multiply
+// M rows x K cols matrix (row-major, stored as float array), K-element vector
+layout(local_size_x = 64) in;
+
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };  // M*K floats
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };  // K floats
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; }; // M floats
+
+#include "pc.h"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+
+    float acc = 0.0;
+    for (uint j = 0; j < pc.width; j++) {
+        acc += matA[i * pc.width + j] * vecB[j];
+    }
+    outData[i] = acc;
+}

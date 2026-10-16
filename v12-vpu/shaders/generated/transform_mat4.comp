@@ -1,0 +1,14 @@
+#version 450
+// V12-VPU generated: unfused MAT4 stage
+layout(local_size_x = 64) in;
+layout(set=0,binding=0,std430) readonly buffer InA { vec4 inA[]; };
+layout(set=0,binding=2,std430) writeonly buffer Scr1 { vec4 scratch1[]; };
+#include "pc.h"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    vec4 a = inA[i];
+    vec4 m = vec4(dot(pc.row0,a)+pc.bias.x, dot(pc.row1,a)+pc.bias.y,
+                  dot(pc.row2,a)+pc.bias.z, dot(pc.row3,a)+pc.bias.w);
+    scratch1[i] = m;
+}

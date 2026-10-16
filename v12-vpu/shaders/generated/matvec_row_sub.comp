@@ -1,0 +1,36 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// matvec_row_sub.comp - standard (unfused) per-row matvec, subgroup organization, SAME as the
+// fused twin's dot phase so the ONLY variable is fusion (normed[] elided in the fused kernel).
+// Binding 0 = matA[rows*K], 1 = normed[rows*K] (written by a separate rmsnorm pass), 2 = out[rows].
+// Provenance (AGENTS.md): clean-room standard organization.
+layout(local_size_x = LOCAL_X) in;
+layout(set=0, binding=0, std430) readonly  buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly  buffer Act  { float normed[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out  { float outv[]; };
+#include "pc.h"
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+// Xe-LPG subgroupSize scales with workgroup size (observed 8/16/32), so the number of
+// subgroups per WG is runtime gl_NumSubgroups, not LOCAL_X/32. Size s_part to the worst
+// case (min subgroupSize=8) and sum over gl_NumSubgroups to stay correct for every LOCAL_X.
+shared float s_part[LOCAL_X / 8u];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint base = row * pc.width;
+    float acc = 0.0;
+    for (uint i = lane; i < pc.width; i += LOCAL_X)
+        acc += matA[base + i] * normed[base + i];
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+    float t = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) t += s_part[s];
+        outv[row] = t;
+    }
+}

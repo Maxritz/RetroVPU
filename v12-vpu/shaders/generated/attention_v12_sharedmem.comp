@@ -1,0 +1,26 @@
+#version 450
+// V12-VPU attention: shared-memory tiled scores
+// One row per workgroup. Loads row into shared memory, each thread computes ~1 column's dot product.
+// 1D workgroup (64 threads) routes to async compute engines (not 3D pipeline).
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Hidden { float hidden[]; };
+layout(set=0, binding=1, std430) writeonly buffer Scores { float outData[]; };
+#include "pc.h"
+#define HEAD_DIM 64
+shared float s_row[HEAD_DIM];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+    uint k = pc.count;
+    if (wid >= k) return;
+    // Load row wid into shared memory (64 threads each load 1 element)
+    s_row[tid] = hidden[wid * HEAD_DIM + tid];
+    barrier();
+    // Each thread computes columns tid, tid+64, tid+128, ...
+    for (uint c = tid; c < k; c += 64u) {
+        float acc = 0.0;
+        for (uint d = 0u; d < HEAD_DIM; d++)
+            acc += s_row[d] * hidden[c * HEAD_DIM + d];
+        outData[wid * k + c] = acc / sqrt(float(HEAD_DIM));
+    }
+}

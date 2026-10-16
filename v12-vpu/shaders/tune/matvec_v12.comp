@@ -1,0 +1,42 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+// V12 organization: one workgroup per output row; LOCAL_X lanes cooperate over K
+// with vec4 loads + subgroup reduction (same topology as fused_qkv).
+// Tuning knob: LOCAL_X (lanes per row). Requires pc.width % 4 == 0.
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+layout(local_size_x = LOCAL_X) in;
+layout(set=0, binding=0, std430) readonly  buffer Mat { vec4 matA4[]; };
+layout(set=0, binding=1, std430) readonly  buffer Vec { vec4 vecB4[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+
+const uint NSG = LOCAL_X / 32u;
+shared float s_part[NSG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint k4 = pc.width >> 2u;
+    uint base = row * k4;
+    float acc = 0.0;
+    for (uint j = tid; j < k4; j += LOCAL_X) {
+        vec4 w = matA4[base + j];
+        vec4 x = vecB4[j];
+        acc = fma(w.x, x.x, acc);
+        acc = fma(w.y, x.y, acc);
+        acc = fma(w.z, x.z, acc);
+        acc = fma(w.w, x.w, acc);
+    }
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (tid == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < NSG; ++s) t += s_part[s];
+        outData[row] = t;
+    }
+}

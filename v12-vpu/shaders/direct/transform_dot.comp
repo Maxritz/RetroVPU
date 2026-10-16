@@ -1,0 +1,13 @@
+#version 450
+// Direct Vulkan, unfused transform stage 3/3: DOT_F32
+// Binding 3=scratch2(in), 1=inB(in), 4=output(out)
+layout(local_size_x = 64) in;
+layout(set=0,binding=3,std430) readonly buffer Scr2 { vec4 scratch2[]; };
+layout(set=0,binding=1,std430) readonly buffer InB  { vec4 inB[]; };
+layout(set=0,binding=4,std430) writeonly buffer Out  { float outData[]; };
+#include "pc.h"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    outData[i] = dot(scratch2[i], inB[i]);
+}

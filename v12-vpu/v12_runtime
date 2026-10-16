@@ -1,0 +1,287 @@
+"""
+PagedAttention KV-cache for V12-VPU.
+
+v12 ideology: the active GPU lever is matvec_gguf_v12 (q8.0, 10.742x vs direct,
+driver-safe fp32/int32 path — int8 `DotProduct` SPIR-V hangs vkCreateComputePipelines
+on Xe-LPG, see RUN-020). PagedAttention is the *memory-placement* lever: KV pages
+block-resident in GPU RAM, cold pages spilled to CPU RAM, page-table indirection
+gathers only resident blocks per decode step. Attention *compute* stays on CPU
+numpy (reusing matvec_gguf_v12 for QKVO projections) so the ONLY variable R2 measures
+is KV-cache paging — not a transfer-bandwidth lever. This is a GPU-attention
+follow-on (blocked while int8/dot hangs).
+
+Clean-room: inspired by the vLLM PagedAttention *idea* (page table + copy-on-write
+share) per AGENTS provenance — implementation is original.
+
+R3 contract: Llama Q/KV, D_head=64, 32 q-heads / 8 kv-heads (GQA), head_dim=64,
+page_tokens=16 (PAGE_BLOCK), fp16 KV (2 bytes), rope_dim=64=head_dim => RoPE is
+identity (matches smoke n_past=0 assumption only when not stepping).
+"""
+from __future__ import annotations
+import math, struct
+import numpy as np
+
+PAGE_BLOCK = 16          # tokens per KV page (R3 workload contract)
+KV_DTYPE = np.float16    # Llama-3 attention KV is fp16 on Xe-LPG (fp16 accel in HW; saved by loader as fp16)
+KV_BYTES = 2
+
+
+class PagedKV:
+    """Paged KV cache: page-table + CPU-RAM spill, resident page set tracked hot.
+    R4: attention gather is exact (page gather is a reshape/gather, no compute).
+    """
+
+    def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int,
+                 page_tokens: int = PAGE_BLOCK, max_gpu_pages: int = 0):
+        # R3 contract (Llama-3.2-1B: layers from GGUF, 8 kv-heads, head_dim 64)
+        self.L = num_layers
+        self.H = num_kv_heads
+        self.D = head_dim
+        self.PT = page_tokens
+        # page layout: [page_tokens, H, D] per layer, per page
+        self.page_bytes = page_tokens * num_kv_heads * head_dim * KV_BYTES
+        # resident set + spill backing (CPU RAM) — cold pages live here in full precision
+        self.resident = set()                       # page_id -> np.memmap (hot, fp16)
+        self.spill = {}                             # page_id -> np.memmap (cold, fp16, CPU)
+        self._page_store = {}                       # page_id -> np.ndarray view (owned)
+        self.used_pages = 0
+        self.max_gpu_pages = max_gpu_pages          # 0 => no paging pressure (tests)
+
+    def _page_shape(self):
+        return (self.PT, self.H, self.D)
+
+    def num_pages(self, seqlen: int) -> int:
+        return (seqlen + self.PT - 1) // self.PT
+
+    def allocate(self, seqlen: int) -> int:
+        """Pre-size page table for a seqlen prompt. Returns page count."""
+        npages = self.num_pages(seqlen)
+        self.used_pages = npages
+        return npages
+
+    # --- write path: during prefill, fill pages from dequantized K/V ---
+    def write_page(self, layer: int, page_id: int, k_page: np.ndarray, v_page: np.ndarray):
+        """k_page,v_page: (PT', H, D) fp16 (PT' <= self.PT last page may be partial)."""
+        k_page = np.ascontiguousarray(k_page, dtype=KV_DTYPE)
+        v_page = np.ascontiguousarray(v_page, dtype=KV_DTYPE)
+        key = (layer, page_id)
+        self._page_store[key] = (k_page, v_page)
+        # on this CPU-only harness there is no GPU VRAM; treat all pages resident.
+        # (real Xe-LPG fp32-Vulkan impl: resident = GPU buffer; else GPU->spill mmap.)
+        self.resident.add(key)
+        self._enforce_residency()
+
+    def _enforce_residency(self):
+        """Keep at most max_gpu_pages resident per instance; spill oldest (lowest page_id).
+        R2: this ONLY changes residency/bookkeeping, never the gather result.
+        NOTE: under full-prefix causal attention, gather_kv/touch() demand-faults
+        every spilled page back in, so steady-state resident returns to total —
+        the cap's genuine win is CAPACITY (run context > VRAM by spilling to CPU),
+        not a resident reduction during a single decode."""
+        if self.max_gpu_pages <= 0:
+            return
+        while len(self.resident) > self.max_gpu_pages:
+            oldest = sorted(self.resident, key=lambda k: (k[1], k[0]))[0]
+            self.mark_spilled(*oldest)
+
+    def resident_bytes(self) -> int:
+        """Bytes of K+V currently resident (hot), counted by actual tokens per
+        page (partial last page counted by its real token count)."""
+        b = 0
+        for key, (k, v) in self._page_store.items():
+            if key in self.resident:
+                b += k.nbytes + v.nbytes
+        return b
+
+    def mark_spilled(self, layer: int, page_id: int):
+        """Evict a page from the resident (hot) set to CPU RAM (spill)."""
+        key = (layer, page_id)
+        if key in self.resident:
+            k, v = self._page_store.get(key, (None, None))
+            if k is not None:
+                self.spill[key] = (k, v)   # cold pages remain in CPU RAM (mmap in real impl)
+            self.resident.discard(key)
+
+    def touch(self, layer: int, page_id: int):
+        """Page-fault: pull cold page back into the resident set."""
+        key = (layer, page_id)
+        if key not in self.resident and key in self.spill:
+            self.resident.add(key)  # resident again (would re-upload to GPU here)
+        return key in self.resident
+
+    # --- gather: assemble the full K/V for a step's attention from resident pages ---
+    def gather_kv(self, layer: int, seqlen: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return (K, V) = (seqlen, H, D) fp16, assembled from resident+cold pages
+        (cold pages are faulted in transparently = copy-on-touch, no recompute).
+        R4: this is a gather, NOT a compute rewrite — result equals contiguous KV."""
+        H, D, PT = self.H, self.D, self.PT
+        K = np.empty((seqlen, H, D), dtype=KV_DTYPE)
+        V = np.empty((seqlen, H, D), dtype=KV_DTYPE)
+        full = npages = self.num_pages(seqlen)
+        off = 0
+        for pg in range(npages):
+            key = (layer, pg)
+            k, v = self._page_store.get(key, (None, None))
+            if k is None:
+                # cold page was evicted and freed from RAM backing (real impl: read from disk/SSD)
+                raise RuntimeError(f"page ({layer},{pg}) missing — would fault from backing store")
+            self.touch(layer, pg)                 # mark resident again
+            n = min(PT, seqlen - off)
+            K[off:off + n] = np.ascontiguousarray(k[:n], dtype=KV_DTYPE)
+            V[off:off + n] = np.ascontiguousarray(v[:n], dtype=KV_DTYPE)
+            off += n
+        return K, V
+
+    def resident_bytes(self) -> int:
+        """Bytes of K+V currently resident (hot), per this layer instance.
+        Partial last page counted by its actual token count (page-internal
+        fragmentation is the realistic VRAM cost). When pages are spilled,
+        this drops below total_bytes — the paging win."""
+        b = 0
+        for key, (k, v) in self._page_store.items():
+            if key in self.resident:
+                b += k.nbytes + v.nbytes
+        return b
+
+    def total_bytes(self, seqlen: int) -> int:
+        """Exact contiguous K+V bytes for one layer over seqlen tokens."""
+        return 2 * self.H * self.D * seqlen * KV_BYTES
+
+
+def split_kv_heads(k: np.ndarray, v: np.ndarray, h_q: int):
+    """Split K/V from (seqlen, Hkv, D) -> (H_q, seqlen, D) via GQA repeat."""
+    Hq, Hkv = h_q, k.shape[1]
+    rep = Hq // Hkv
+    K = np.repeat(k, rep, axis=1).transpose(1, 0, 2).reshape(Hq, k.shape[0], D :=
+        k.shape[2])
+    V = np.repeat(v, rep, axis=1).transpose(1, 0, 2).reshape(Hq, v.shape[0], v.shape[2])
+    return K, V
+
+
+def attention_gqa_rope(xq, xk, xv, past_len=0, rope_freq=10000.0, head_dim=64,
+                       rope_dim=64, seqlen=None, causal=True):
+    """Scaled dot-product GQA attention (CPU numpy) — identical math to smoke's
+    attention block, extended to multi-token. rope_dim=head_dim=> identity here
+    only at m=0; for seqlen>1 a real cos/sin RoPE is applied.
+    xq: (Hq,D) query for the NEW token; xk,xv: (seqlen,Hkv,D) cached K/V.
+    Returns (seqlen, Hq) weights + ctx (Hq,D)."""
+    Hq = xq.shape[0]
+    Hkv = xk.shape[1]
+    seqlen = xk.shape[0]
+    rep = Hq // Hkv
+    K = np.repeat(xk, rep, axis=1)            # (seqlen, Hq, D)
+    V = np.repeat(xv, rep, axis=1)            # (seqlen, Hq, D)
+    Q = xq                                    # (Hq, D)
+    # RoPE (real, for seqlen>1; rope_dim=head_dim -> full rotation)
+    if past_len == 0 and seqlen == 1:
+        # identity path (smoke): q sees itself only, rope at m=0 is identity
+        q = Q.astype(np.float32)
+    else:
+        pos = past_len
+        q = apply_rope(Q.astype(np.float32), pos, rope_freq, head_dim, rope_dim)
+        K = apply_rope(K.astype(np.float32), np.arange(seqlen), rope_freq, head_dim, rope_dim)
+    # scores (Hq, seqlen)
+    sc = (q[:, None, :] * K.transpose(1, 0, 2)).sum(axis=2) / math.sqrt(head_dim)
+    if causal:
+        # mask future tokens relative to current pos
+        full = past_len + 1
+        for i in range(Hq):
+            sc[i, past_len + 1:] = -1e30  # cannot attend to not-yet-computed future
+    w = np.exp(sc - sc.max(axis=1, keepdims=True))
+    w = w / w.sum(axis=1, keepdims=True)
+    ctx = (w[:, :, None] * V.transpose(1, 0, 2)).sum(axis=1)   # (Hq, D)
+    return w, ctx
+
+
+def apply_rope(xq, positions, rope_freq, head_dim, rope_dim):
+    """Standard RoPE cos/sin rotation applied along the first rope_dim dims.
+    xq: (..., seq, H, D) OR (seq, D) for a single query. positions: int or
+    array of length seq (broadcast over the head axis)."""
+    xq = xq.astype(np.float32)
+    thetas = 1.0 / (rope_freq ** (np.arange(0, rope_dim, 2, dtype=np.float32) / head_dim))  # (D/2,)
+    if np.ndim(positions):
+        pos = np.asarray(positions, dtype=np.float32)            # (seq,)
+        freqs = pos[:, None] * thetas[None, :]                    # (seq, D/2)
+    else:
+        pos = float(positions)
+        freqs = np.array([[pos * t for t in thetas]])             # (1, D/2)
+    cos = np.cos(freqs); sin = np.sin(freqs)
+    x = xq[..., :rope_dim]
+    x1 = x[..., 0::2]; x2 = x[..., 1::2]
+    # broadcast freqs over head axis if x has a head dim
+    if x.ndim >= 3:                       # (seq, H, D)
+        cos = cos[:, None, :]; sin = sin[:, None, :]   # (seq, 1, D/2)
+    xr1 = x1 * cos - x2 * sin
+    xr2 = x1 * sin + x2 * cos
+    out = np.stack([xr1, xr2], axis=-1).reshape(*xq.shape[:-1], -1)
+    if rope_dim < head_dim:
+        out = np.concatenate([out, xq[..., rope_dim:]], axis=-1)
+    return out
+
+
+# --- clean-room Llama-BPE tokenizer (byte-level, pre=llama-bpe) ---
+# Idea only (AGENTS R6): byte-level BPE using the GGUF-stored tokens+merges.
+# Implementation written for this project, not copied from any repo.
+_U2B = {chr(256 + i): b for i, b in enumerate(range(256))}
+_B2U = {v: k for k, v in _U2B.items()}
+
+
+def _byte_encode(s: str) -> bytes:
+    return bytes(_U2B[c] for c in s)
+
+
+def _byte_decode(bs: bytes) -> str:
+    return "".join(_B2U[b] for b in bs)
+
+
+class LlamaBPE:
+    """Minimal byte-level BPE encoder for Llama (token table + merges from GGUF).
+    tokens[] is id->string (space byte = 'Ġ' = U+0120)."""
+
+    def __init__(self, tokens: list, merges: list):
+        self.tokens = tokens
+        self.merges = merges
+        self.t2i = {}
+        for i, t in enumerate(tokens):
+            self.t2i.setdefault(t, i)
+        for b in range(256):
+            s = _byte_decode(bytes([b]))
+            self.t2i.setdefault(s, self.t2i.get(s, 0))
+
+    def encode(self, text: str, max_len: int = 256) -> list:
+        import re
+        pat = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d|''| ?\S+")
+        words = pat.findall(text)
+        ids = []
+        for w in words:
+            ids.extend(self._encode_word(w))
+            if len(ids) >= max_len:
+                break
+        return ids[:max_len]
+
+    def _encode_word(self, w: str):
+        # byte-level encode, with space -> Ġ (U+0120) prefix per Llama convention
+        s = _byte_decode(_byte_encode(w.replace(" ", " "))) if False else None
+        s = w.replace(" ", "\u0120")
+        if s in self.t2i:
+            return [self.t2i[s]]
+        if len(s) == 1:
+            return [self.t2i.get(s, 0)]
+        word = list(s)
+        m2rank = {m: i for i, m in enumerate(self.merges)}
+        pairs = set(zip(word[:-1], word[1:]))
+        while pairs:
+            bigram = min(pairs, key=lambda p: m2rank.get(p, len(m2rank)))
+            if bigram not in m2rank:
+                break
+            a, b = bigram
+            out = []; i = 0
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i + 1]) == bigram:
+                    out.append(a + b); i += 2
+                else:
+                    out.append(word[i]); i += 1
+            word = out
+            pairs = set(zip(word[:-1], word[1:])) if len(word) > 1 else set()
+        return [self.t2i.get("".join(word), 0)]
+

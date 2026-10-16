@@ -1,0 +1,486 @@
+// vulkan_bench.cpp — V12-VPU vs native Vulkan GPU benchmark runner
+//
+// Compiles with MSVC:
+//   cl /std:c++20 /O2 /EHsc /I"$(VULKAN_SDK)\Include" \
+//      vulkan_bench.cpp user32.lib "$(VULKAN_SDK)\Lib\vulkan-1.lib" -o vulkan_bench.exe
+//
+// Usage:
+//   vulkan_bench --spv spv1.spv [spv2.spv ...] --pc pc.bin --count N --wg 64
+//              --buf 0 in_a.bin out_a.bin sz --buf 1 in_b.bin - sz ...
+//              --warmup 5 --iters 21 --ref ref.bin --tol 1e-5
+//
+// Output: JSON to stdout
+#include <vulkan/vulkan.h>
+#include <windows.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <cmath>
+
+using namespace std;
+
+static vector<uint32_t> load_spv(const char* p) {
+    ifstream f(p, ios::binary | ios::ate);
+    if (!f) { fprintf(stderr, "ERR: cannot open %s\n", p); exit(1); }
+    size_t sz = f.tellg(); f.seekg(0);
+    vector<uint32_t> code(sz/4);
+    f.read(reinterpret_cast<char*>(code.data()), sz);
+    return code;
+}
+
+static vector<uint8_t> load_bytes(const char* p) {
+    ifstream f(p, ios::binary | ios::ate);
+    if (!f) { fprintf(stderr, "ERR: cannot open %s\n", p); exit(1); }
+    size_t sz = f.tellg(); f.seekg(0);
+    vector<uint8_t> d(sz); f.read(reinterpret_cast<char*>(d.data()), sz);
+    return d;
+}
+
+struct BufSpec {
+    uint32_t binding;
+    string   input_file;
+    string   output_file;
+    size_t   size;
+};
+
+struct Cfg {
+    vector<string> spv_files;
+    string pc_file;
+    uint32_t count = 1, wg = 64, warmup = 5, iters = 21;
+    float tol = 1e-5f;
+    string ref_file;
+    vector<BufSpec> bufs;
+    bool unfused = false;
+    uint32_t gx = 0, gy = 0;  // explicit 2D dispatch (0 = compute from count)
+};
+
+static Cfg parse_args(int argc, char** argv) {
+    Cfg c;
+    for (int i = 1; i < argc; i++) {
+        string a = argv[i];
+        if (a == "--spv" && i+1 < argc) c.spv_files.push_back(argv[++i]);
+        else if (a == "--pc" && i+1 < argc) c.pc_file = argv[++i];
+        else if (a == "--count" && i+1 < argc) c.count = stoul(argv[++i]);
+        else if (a == "--wg" && i+1 < argc) c.wg = stoul(argv[++i]);
+        else if (a == "--width" && i+1 < argc) c.count = stoul(argv[++i]);
+        else if (a == "--gx" && i+1 < argc) c.gx = stoul(argv[++i]);
+        else if (a == "--gy" && i+1 < argc) c.gy = stoul(argv[++i]);
+        else if (a == "--warmup" && i+1 < argc) c.warmup = stoul(argv[++i]);
+        else if (a == "--iters" && i+1 < argc) c.iters = stoul(argv[++i]);
+        else if (a == "--tol" && i+1 < argc) c.tol = stof(argv[++i]);
+        else if (a == "--ref" && i+1 < argc) c.ref_file = argv[++i];
+        else if (a == "--buf" && i+4 < argc) {
+            i++; c.bufs.push_back({(uint32_t)stoul(argv[i]), argv[++i], argv[++i],
+                                  (size_t)stoull(argv[++i])});
+        }
+    }
+    if (c.spv_files.empty()) {
+        fprintf(stderr, "Usage: vulkan_bench --spv <f> [--pc pc.bin] --count N --wg 64 --buf b in out sz --ref r --tol f\n");
+        exit(1);
+    }
+    c.unfused = c.spv_files.size() > 1;
+    return c;
+}
+
+struct VkBuf {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+};
+
+VkInstance g_inst;
+VkPhysicalDevice g_physDev;
+VkDevice g_dev;
+VkQueue g_q;
+uint32_t g_qf = ~0u;
+VkCommandPool g_pool;
+VkQueryPool g_tsPool;
+VkPhysicalDeviceProperties g_props;
+VkQueueFamilyProperties g_qp;  // selected queue family props
+
+bool vk_init() {
+    // Instance
+    VkApplicationInfo ai{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    ai.pApplicationName = "vulkan_bench"; ai.applicationVersion = 1;
+    ai.pEngineName = "bench"; ai.engineVersion = 1;
+    ai.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ici.pApplicationInfo = &ai;
+    if (vkCreateInstance(&ici, nullptr, &g_inst) != VK_SUCCESS) {
+        fprintf(stderr, "ERR: vkCreateInstance\n"); return false;
+    }
+
+    // Physical device
+    uint32_t n;
+    vkEnumeratePhysicalDevices(g_inst, &n, nullptr);
+    vector<VkPhysicalDevice> devs(n);
+    vkEnumeratePhysicalDevices(g_inst, &n, devs.data());
+    if (!n) { fprintf(stderr, "ERR: no device\n"); return false; }
+    g_physDev = devs[0];
+    vkGetPhysicalDeviceProperties(g_physDev, &g_props);
+        fprintf(stderr, "GPU: %s (Vulkan %u.%u.%u)\n", g_props.deviceName,
+           VK_API_VERSION_MAJOR(g_props.apiVersion),
+           VK_API_VERSION_MINOR(g_props.apiVersion),
+           VK_API_VERSION_PATCH(g_props.apiVersion));
+        fprintf(stderr, "TS period: %.3f ns\n", g_props.limits.timestampPeriod);
+
+    // Queue family
+    uint32_t qc;
+    vkGetPhysicalDeviceQueueFamilyProperties(g_physDev, &qc, nullptr);
+    vector<VkQueueFamilyProperties> qp(qc);
+    // g_qp will be set after selection below
+    vkGetPhysicalDeviceQueueFamilyProperties(g_physDev, &qc, qp.data());
+    for (uint32_t i = 0; i < qc; i++)
+        if ((qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { g_qf = i; break; }
+    // Fallback: any queue with compute capability. Loud on purpose: a graphics+compute
+    // family may route dispatches to the render/3D engine instead of Compute_0.
+    if (g_qf == ~0u) {
+        for (uint32_t i = 0; i < qc; i++)
+            if (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { g_qf = i; break; }
+        if (g_qf != ~0u)
+            fprintf(stderr, "WARN: no dedicated compute family; using graphics+compute "
+                    "family %u (work may run on the 3D engine)\n", g_qf);
+    }
+    if (g_qf == ~0u) {
+        fprintf(stderr, "Fatal: No compute queue found.\n");
+        exit(1);
+    }
+    g_qp = qp[g_qf];  // copy selected queue family props to global
+    fprintf(stderr, "Queue family %u flags: 0x%X (GRAPHICS=%s, COMPUTE=%s)\n",
+       g_qf, g_qp.queueFlags,
+       (g_qp.queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "yes" : "no",
+       (g_qp.queueFlags & VK_QUEUE_COMPUTE_BIT) ? "yes" : "no");
+    fprintf(stderr, "Submitting on queue family %u (dedicated compute=%s)\n",
+       g_qf, (g_qp.queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "no" : "yes");
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+    qci.queueFamilyIndex = g_qf; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    if (vkCreateDevice(g_physDev, &dci, nullptr, &g_dev) != VK_SUCCESS) {
+        fprintf(stderr, "ERR: vkCreateDevice\n"); return false;
+    }
+    vkGetDeviceQueue(g_dev, g_qf, 0, &g_q);
+
+    VkCommandPoolCreateInfo cpi{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    cpi.queueFamilyIndex = g_qf; cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vkCreateCommandPool(g_dev, &cpi, nullptr, &g_pool);
+
+    VkQueryPoolCreateInfo tpi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    tpi.queryType = VK_QUERY_TYPE_TIMESTAMP; tpi.queryCount = 256;
+    vkCreateQueryPool(g_dev, &tpi, nullptr, &g_tsPool);
+    return true;
+}
+
+VkBuf make_buffer(VkDeviceSize sz, VkBufferUsageFlags usage, VkMemoryPropertyFlags props) {
+    VkBuf b;
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = sz; bci.usage = usage; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(g_dev, &bci, nullptr, &b.buffer);
+
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(g_dev, b.buffer, &mr);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g_physDev, &mp);
+    uint32_t mt = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((mr.memoryTypeBits & (1u<<i)) &&
+            (mp.memoryTypes[i].propertyFlags & props) == props) { mt = i; break; }
+    if (mt == UINT32_MAX) { fprintf(stderr, "ERR: no mem type\n"); exit(1); }
+
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+    vkAllocateMemory(g_dev, &mai, nullptr, &b.memory);
+    vkBindBufferMemory(g_dev, b.buffer, b.memory, 0);
+    b.size = sz;
+    return b;
+}
+
+void upload(const VkBuf& b, const void* data, VkDeviceSize sz) {
+    void* d; vkMapMemory(g_dev, b.memory, 0, sz, 0, &d);
+    memcpy(d, data, (size_t)sz); vkUnmapMemory(g_dev, b.memory);
+}
+
+void readback(const VkBuf& b, void* out, VkDeviceSize sz) {
+    void* s; vkMapMemory(g_dev, b.memory, 0, sz, 0, &s);
+    memcpy(out, s, (size_t)sz); vkUnmapMemory(g_dev, b.memory);
+}
+
+void destroy_buf(VkBuf& b) {
+    if (b.buffer) vkDestroyBuffer(g_dev, b.buffer, nullptr);
+    if (b.memory) vkFreeMemory(g_dev, b.memory, nullptr);
+}
+
+VkShaderModule make_shader(const char* path) {
+    auto code = load_spv(path);
+    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smci.codeSize = code.size()*4; smci.pCode = code.data();
+    VkShaderModule sm;
+    vkCreateShaderModule(g_dev, &smci, nullptr, &sm);
+    return sm;
+}
+
+int main(int argc, char** argv) {
+    Cfg cfg = parse_args(argc, argv);
+    if (!vk_init()) return 1;
+
+    // Buffers + descriptors
+    vector<VkBuf> bufs(cfg.bufs.size());
+    vector<VkDescriptorSetLayoutBinding> bindings;
+    vector<VkDescriptorBufferInfo> binfo;
+    for (size_t k = 0; k < cfg.bufs.size(); k++) {
+        const auto& bs = cfg.bufs[k];
+        bufs[k] = make_buffer(bs.size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!bs.input_file.empty() && bs.input_file != "-") {
+            auto data = load_bytes(bs.input_file.c_str());
+            upload(bufs[k], data.data(), min((size_t)bs.size, data.size()));
+        }
+        binfo.push_back({bufs[k].buffer, 0, bs.size});
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = bs.binding;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings.push_back(b);
+    }
+
+    VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dslci.bindingCount = (uint32_t)bindings.size();
+    dslci.pBindings = bindings.data();
+    VkDescriptorSetLayout dsLayout;
+    vkCreateDescriptorSetLayout(g_dev, &dslci, nullptr, &dsLayout);
+
+    vector<VkDescriptorPoolSize> poolSizes = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)bufs.size()}};
+    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = poolSizes.data();
+    VkDescriptorPool pool; vkCreateDescriptorPool(g_dev, &dpci, nullptr, &pool);
+
+    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dsai.descriptorPool = pool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsLayout;
+    VkDescriptorSet ds; vkAllocateDescriptorSets(g_dev, &dsai, &ds);
+
+    for (size_t k = 0; k < bufs.size(); k++) {
+        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w.dstSet = ds; w.dstBinding = bindings[k].binding;
+        w.descriptorCount = 1; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &binfo[k];
+        vkUpdateDescriptorSets(g_dev, 1, &w, 0, nullptr);
+    }
+
+    // Pipeline layout (128-byte push constant)
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0; pcr.size = 128;
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount = 1; plci.pSetLayouts = &dsLayout;
+    plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
+    VkPipelineLayout pipeLayout;
+    vkCreatePipelineLayout(g_dev, &plci, nullptr, &pipeLayout);
+
+    // Pipelines
+    vector<VkShaderModule> shaders;
+    vector<VkPipeline> pipelines;
+    for (const auto& sp : cfg.spv_files) {
+        shaders.push_back(make_shader(sp.c_str()));
+        VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpci.stage.module = shaders.back();
+        cpci.stage.pName = "main";
+        cpci.layout = pipeLayout;
+        VkPipeline p;
+        if (vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &p) != VK_SUCCESS) {
+            fprintf(stderr, "ERR: pipeline for %s\n", sp.c_str()); return 1;
+        }
+        pipelines.push_back(p);
+    }
+
+    // Push constant
+    vector<uint8_t> pcData(128, 0);
+    if (!cfg.pc_file.empty()) {
+        auto d = load_bytes(cfg.pc_file.c_str());
+        memcpy(pcData.data(), d.data(), min(d.size(), (size_t)128));
+    }
+
+    // Command buffer
+    VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;     cbai.commandPool = g_pool; cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd; vkAllocateCommandBuffers(g_dev, &cbai, &cmd);
+
+    uint32_t dispatch_x, dispatch_y, dispatch_z;
+    if (cfg.gx > 0) { dispatch_x = cfg.gx; dispatch_y = cfg.gy > 0 ? cfg.gy : 1; dispatch_z = 1; }
+    else { dispatch_x = (cfg.count + cfg.wg - 1) / cfg.wg; dispatch_y = 1; dispatch_z = 1; }
+
+    uint32_t nStages = (uint32_t)pipelines.size();
+    uint32_t nTsQueries = cfg.unfused ? (nStages + 1) : 2;  // start + per-stage timestamps
+
+    auto record = [&]() {
+        vkResetCommandBuffer(cmd, 0);
+        VkCommandBufferBeginInfo cbi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &cbi);
+        vkCmdResetQueryPool(cmd, g_tsPool, 0, nTsQueries);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsPool, 0);
+
+        if (cfg.unfused) {
+            for (size_t s = 0; s < nStages; s++) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[s]);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout,
+                                        0, 1, &ds, 0, nullptr);
+                vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 128, pcData.data());
+                vkCmdDispatch(cmd, dispatch_x, dispatch_y, dispatch_z);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsPool, (uint32_t)(s + 1));
+            }
+        } else {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[0]);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout,
+                                    0, 1, &ds, 0, nullptr);
+            vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, 128, pcData.data());
+            vkCmdDispatch(cmd, dispatch_x, dispatch_y, dispatch_z);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsPool, 1);
+        }
+
+        vkEndCommandBuffer(cmd);
+    };
+
+    // Warmup
+    for (uint32_t w = 0; w < cfg.warmup; w++) {
+        record();
+        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        vkQueueSubmit(g_q, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(g_q);
+    }
+
+    // Benchmark
+    vector<float> gpu, host;
+    vector<vector<float>> stage_gpu_times;  // per-iteration per-stage timings
+    uint32_t nDisp = cfg.unfused ? (uint32_t)pipelines.size() : 1;
+    for (uint32_t iter = 0; iter < cfg.iters; iter++) {
+        auto t0 = chrono::high_resolution_clock::now();
+        record();
+        VkFence f; VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        vkCreateFence(g_dev, &fci, nullptr, &f);
+        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        vkQueueSubmit(g_q, 1, &si, f);
+        vkWaitForFences(g_dev, 1, &f, VK_TRUE, UINT64_MAX);
+        auto t1 = chrono::high_resolution_clock::now();
+        vkDestroyFence(g_dev, f, nullptr);
+
+        host.push_back(chrono::duration<float, micro>(t1-t0).count());
+        vector<uint64_t> ts(nTsQueries, 0);
+        VkResult vkr = vkGetQueryPoolResults(g_dev, g_tsPool, 0, nTsQueries,
+                               ts.size() * sizeof(uint64_t), (void*)ts.data(),
+                               sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        float gpu_us;
+        if (vkr == VK_SUCCESS && ts[0] <= ts[nTsQueries-1] && (ts[nTsQueries-1]-ts[0]) < 100000000ULL) {
+            gpu_us = (float)(ts[nTsQueries-1]-ts[0]) * g_props.limits.timestampPeriod / 1000.0f;
+        } else {
+            gpu_us = host.back();
+        }
+        gpu.push_back(gpu_us);
+
+        // Per-stage timing for unfused (nStages + 1 timestamps: start, after_stage_0, ..., after_stage_N-1)
+        if (cfg.unfused && vkr == VK_SUCCESS) {
+            vector<float> stage_times;
+            for (uint32_t s = 0; s < nStages; s++) {
+                uint64_t delta = ts[s+1] - ts[s];
+                if (delta < 100000000ULL)
+                    stage_times.push_back((float)delta * g_props.limits.timestampPeriod / 1000.0f);
+                else
+                    stage_times.push_back(0);
+            }
+            stage_gpu_times.push_back(stage_times);
+        }
+    }
+
+    // Aggregate per-stage timings (median)
+    vector<float> stage_median;
+    if (!stage_gpu_times.empty()) {
+        for (uint32_t s = 0; s < nStages; s++) {
+            vector<float> vals;
+            for (auto& iter_stages : stage_gpu_times) vals.push_back(iter_stages[s]);
+            sort(vals.begin(), vals.end());
+            stage_median.push_back(vals[vals.size()/2]);
+        }
+    }
+
+    // Dump output buffers + validate
+    bool correct = true;
+    auto ref = cfg.ref_file.empty() ? vector<uint8_t>{} : load_bytes(cfg.ref_file.c_str());
+    for (size_t k = 0; k < bufs.size(); k++) {
+        if (!cfg.bufs[k].output_file.empty() && cfg.bufs[k].output_file != "-") {
+            vector<uint8_t> out(cfg.bufs[k].size);
+            readback(bufs[k], out.data(), cfg.bufs[k].size);
+            ofstream of(cfg.bufs[k].output_file, ios::binary);
+            of.write((char*)out.data(), out.size());
+
+            if (!ref.empty() && ref.size() == out.size() && ref.size() >= 4) {
+                uint32_t n = (uint32_t)(ref.size()/4);
+                for (uint32_t j = 0; j < n; j++) {
+                    float rv = *(float*)&ref[j*4];
+                    float ov = *(float*)&out[j*4];
+                    if (abs(rv-ov) > cfg.tol * max(1.0f, abs(rv))) { correct = false; break; }
+                }
+            }
+            break;
+        }
+    }
+
+    // Results
+    sort(gpu.begin(), gpu.end()); sort(host.begin(), host.end());
+    size_t mid = gpu.size()/2;
+    size_t p90 = min((size_t)(gpu.size()*0.9), gpu.size()-1);
+    // Variance
+    double sum = 0, sum_sq = 0;
+    for (auto v : gpu) { sum += v; sum_sq += v*v; }
+    double mean = sum / gpu.size();
+    double variance = sum_sq / gpu.size() - mean * mean;
+    double std_dev = sqrt(variance);
+    double cv = mean > 0 ? std_dev / mean : 0;  // coefficient of variation
+
+    printf("{\"gpu_us_median\":%.3f,\"gpu_us_min\":%.3f,\"gpu_us_p90\":%.3f,"
+           "\"gpu_us_mean\":%.3f,\"gpu_us_stddev\":%.3f,\"gpu_us_cv\":%.6f,"
+           "\"host_us_median\":%.3f,\"dispatches\":%u,\"correct\":%s,"
+           "\"iterations\":%u,\"workgroup_size\":%u,\"count\":%u,\"stages\":%u,"
+           "\"ts_period_ns\":%.6f,\"device_name\":\"%s\","
+           "\"queue_family\":%u,\"queue_flags\":\"0x%X\"",
+           gpu[mid], gpu.front(), gpu[p90], mean, std_dev, cv, host[mid],
+           nDisp, correct?"true":"false", cfg.iters, cfg.wg, cfg.count, nStages,
+           g_props.limits.timestampPeriod, g_props.deviceName, g_qf, g_qp.queueFlags);
+    if (!stage_median.empty()) {
+        printf(",\"stage_us\":[");
+        for (uint32_t s = 0; s < nStages; s++) {
+            if (s) printf(",");
+            printf("%.3f", stage_median[s]);
+        }
+        printf("]");
+    }
+    printf("}\n");
+
+    // Cleanup
+    vkFreeCommandBuffers(g_dev, g_pool, 1, &cmd);
+    for (auto& p : pipelines) vkDestroyPipeline(g_dev, p, nullptr);
+    for (auto& s : shaders) vkDestroyShaderModule(g_dev, s, nullptr);
+    vkDestroyPipelineLayout(g_dev, pipeLayout, nullptr);
+    vkDestroyDescriptorPool(g_dev, pool, nullptr);
+    vkDestroyDescriptorSetLayout(g_dev, dsLayout, nullptr);
+    for (auto& b : bufs) destroy_buf(b);
+    vkDestroyQueryPool(g_dev, g_tsPool, nullptr);
+    vkDestroyCommandPool(g_dev, g_pool, nullptr);
+    vkDestroyDevice(g_dev, nullptr);
+    vkDestroyInstance(g_inst, nullptr);
+    return 0;
+}

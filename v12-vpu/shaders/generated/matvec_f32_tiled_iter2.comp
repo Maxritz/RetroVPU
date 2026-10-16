@@ -1,0 +1,28 @@
+#version 450
+// V12-VPU optimized: tiled FP32 matvec with shared-memory vector + large TILE_K
+// Iteration 2: TILE_K=256, shared vec load, float4 vector loads
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Mat  { float matA[]; };
+layout(set=0, binding=1, std430) readonly buffer Vec  { float vecB[]; };
+layout(set=0, binding=2, std430) writeonly buffer Out { float outData[]; };
+#include "pc.h"
+#define TILE_K 256
+shared float s_vec[TILE_K];
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float acc = 0.0;
+    uint k = pc.width;
+    for (uint j = 0; j < k; j += TILE_K) {
+        uint limit = min(TILE_K, k - j);
+        // Cooperative load: 64 threads each load 4 elements (TILE_K/16)
+        for (uint t = gl_LocalInvocationID.x; t < limit; t += 64u)
+            s_vec[t] = vecB[j + t];
+        barrier();
+        // Compute partial dot product using shared memory
+        for (uint t = 0; t < limit; t++)
+            acc += matA[i * k + j + t] * s_vec[t];
+        barrier();
+    }
+    outData[i] = acc;
+}

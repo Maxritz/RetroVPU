@@ -1,0 +1,78 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#ifdef V12_TRACE
+#extension GL_EXT_shader_realtime_clock : enable
+#endif
+// matvec_gguf_v12_opt.comp - decode-path optimisation of matvec_gguf_v12.comp.
+// Same V12 organisation (WG per row, lanes stride over K groups, subgroup reduce, no dequant,
+// integer accumulate ad[g]*(wsc0*S - wmn0*T)). Decode-path edits only (R2: identical math/output):
+//  (A) deduplicate the a8() activation byte-load: one load per element, reused for S and T.
+//  (B) Q8_0 only: the per-16-element group is block-aligned (BLK=32), so the block scale d is
+//      constant within the group -> hoist rdf16(d) out of the l-loop (wdec recomputed the scale
+//      16x before). wmn0=0 for Q8_0. All other GGUF_TYPEs keep the original per-l wdec (correctness
+//      preserved exactly). Provenance (AGONS.md): clean-room.
+#include "gguf_decode.glsl"
+#include "v12_trace.glsl"
+#ifndef LOCAL_X
+#define LOCAL_X 128
+#endif
+const uint MIN_SUBGROUP = 8u;
+shared float s_part[LOCAL_X / MIN_SUBGROUP];
+layout(local_size_x = LOCAL_X) in;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.count) return;
+    uint rb = row * ((pc.width / BLK) * BPB);
+    uint ng = pc.width / GROUP;
+    uint lane = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    uint tDec = 0u, tMac = 0u, tScl = 0u, tRed = 0u;
+    for (uint g = lane; g < ng; g += LOCAL_X) {
+        int S = 0, T = 0;
+        uvec2 t = v12_now();
+#if GGUF_TYPE == 8
+        // Q8_0: group g spans 16 consecutive elements within one 32-element block -> scale const.
+        uint i0 = (g * GROUP) >> 5u;            // block index (constant for this group)
+        uint base = rb + i0 * 34u;
+        float wsc0 = rdf16(base);               // hoisted out of the l-loop
+        for (uint l = 0u; l < GROUP; ++l) {
+            uint e = g * GROUP + l;
+            int c = int(rd8(base + 2u + (e & 31u)));
+            c = c < 128 ? c : c - 256;
+            int av = a8(e);                     // dedup: one activation load
+            S += c * av;
+            T += av;
+        }
+        uvec2 t1 = v12_now(); tDec += v12_dt(t, t1); t = t1;
+        uvec2 t2 = v12_now(); tScl += v12_dt(t, t2); t = t2;
+        acc += ad[g] * (wsc0 * float(S));   // Q8_0: wmn0 = 0
+#else
+        float wsc0 = 0.0, wmn0 = 0.0;
+        for (uint l = 0u; l < GROUP; ++l) {
+            int c; float ws, wm;
+            wdec(g * GROUP + l, rb, c, ws, wm);
+            uvec2 t1 = v12_now(); tDec += v12_dt(t, t1); t = t1;
+            if (l == 0u) { wsc0 = ws; wmn0 = wm; }
+            int av = a8(g * GROUP + l);         // dedup: one activation load
+            S += c * av;
+            T += av;
+            t = v12_now(); tMac += v12_dt(t1, t);
+        }
+        uvec2 t2 = v12_now(); tScl += v12_dt(t, t2); t = t2;
+        acc += ad[g] * (wsc0 * float(S) - wmn0 * float(T));
+#endif
+    }
+    uvec2 tRedStart = v12_now();
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) s_part[gl_SubgroupID] = acc;
+    barrier();
+    if (lane == 0u) {
+        float z = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) z += s_part[s];
+        outv[row] = z;
+    }
+    uvec2 tr = v12_now(); tRed += v12_dt(tRedStart, tr);
+    V12_TRACE_STORE(row * LOCAL_X + lane, tDec, tMac, tScl, tRed);
+}
