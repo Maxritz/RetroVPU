@@ -98,16 +98,36 @@ src/
 spec/              # Legacy spec directory (referenced by headers)
 ```
 
+## OpenBLAS → GPU Porting with V12 Methods
+
+**Objective:** Port OpenBLAS BLAS algorithms to GPU using V12 methods for performance comparison and optimization.
+
+### Implementation Status
+
+| Algorithm | V12 Methods | Baseline | Status | Notes |
+|-----------|-------------|----------|--------|-------|
+| **GEMM** | V12.TILE + V12.REDUCE + V12.FUSE + V12.COST-GATE | OpenBLAS | ✅ Complete | General Matrix-Matrix Multiplication |
+| **GEMV** | V12.TILE + V12.REDUCE + V12.COST-GATE | Optimized Baseline | ✅ Complete | General Matrix-Vector Multiplication |
+| **SYMM** | V12.TILE + V12.REDUCE + V12.ELIDE + V12.FUSE | OpenBLAS | ✅ Complete | Symmetric Matrix-Matrix Multiplication |
+| **SYR/SYR2** | V12.TILE + V12.ELIDE | Optimized Baseline | ✅ Complete | Symmetric Rank updates |
+| **GER** | V12.TILE + V12.REDUCE | OpenBLAS | ✅ Complete | General Rank-1 update |
+
+### Optimized Baseline Infrastructure
+- **AVX-512 SIMD** accelerated baseline (`optimized_baseline.cpp`)
+- **Multi-threading** with cache-blocking and prefetching
+- **OpenBLAS comparison** via hand-authored clean-room baseline (R6 compliance)
+- **Hypothesis testing** framework (H-GEMV-TILE-1-ENHANCED)
+
 ## V12 Method Implementation Status
 
-| Method | Status | Notes |
-|--------|--------|-------|
-| V12.ELIDE | Implemented | Top-K sparse compute, skip inactive experts |
-| V12.PRECISION | Implemented | INT8 quantized weights vs FP32 baseline |
-| V12.FUSE | Framework | Dispatch grouping ready (single-token currently) |
-| V12.REDUCE | Planned | Subgroup reduction in merge step |
-| V12.TILE | Planned | Autotuned tiling for matmul |
-| V12.COST-GATE | Planned | Dynamic cost model for method selection |
+| Method | Status | Implementation |
+|--------|--------|---------------|
+| V12.ELIDE | ✅ Implemented | Top-K sparse compute in MoE gating; triangular index mirroring in SYMM (saves ~50% memory bandwidth) |
+| V12.PRECISION | ✅ Implemented | INT8 quantized weights vs FP32 baseline; mixed precision dispatch |
+| V12.FUSE | ✅ Implemented | Fused MoE expert dispatch; fused GEMM/GEMV epilogue operations |
+| V12.REDUCE | ✅ Implemented | Subgroup tree-reduce for K-accumulation in GEMM/GEMV/SYMM; batch reduction in Level 1 |
+| V12.TILE | ✅ Implemented | 64×64 tiles for GEMV; 16×16 micro-tiles for SYMM; adaptive tile sizing (128×64→256×256) |
+| V12.COST-GATE | ✅ Implemented | Dynamic cost model; M*N threshold gates GPU dispatch; CPU vs GPU routing
 
 ## License
 

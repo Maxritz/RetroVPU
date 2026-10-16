@@ -17,6 +17,7 @@ namespace VPU {
 
 enum class DType {
     FP32,
+    FP64,
     FP16,
     BF16,
     INT8,
