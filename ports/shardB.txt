@@ -1,0 +1,89 @@
+========================================
+DEPLOY-3 SHARD B: Level 2 BLAS (matrix-vector)
+========================================
+
+## SHARED INTERFACE (frozen — same as Shard A)
+The header `src/blas/vpu_blas.hpp` is created by Shard A and contains:
+- V12Method enum, BLASType enum, DevicePlan struct
+- V12CostModel class
+- VPU_BLAS class with all Level 1 declarations (already implemented)
+- Level 2 declarations (YOU implement these):
+  sgemv, dgemv, sger, dger, ssyr, dsyr, ssyr2, dsyr2,
+  ssymv, dsymv, strmv, dtrmv, strsv, dtrsv,
+  sgbmv, dgbmv, ssbmv, dsbmv, stbmv, dtbmv, stbsv, dtbsv,
+  spmv, dpmv (packed symv), spr, dpr (packed syr),
+  spv, dpv (packed symv), stri, dtri (inverted triangular)
+- Level 3 declarations (Shard C implements):
+  sgemm, ssymm, dsymm, ssyrk, dsyrk, ssyr2k, dsyr2k,
+  strmm, dtrmm, strsm, dtrsm,
+  sgemm_batch, dgemm_batch, sgemm_batch_strided
+
+Use `#include "vpu_blas.hpp"` in your files.
+
+## YOUR TASK (Shard B only):
+
+### 1. Create src/blas/vpu_level2.hpp
+Declaration of all Level 2 BLAS functions with V12 method annotations.
+
+### 2. Create src/blas/vpu_level2.cpp
+Implement ALL Level 2 functions from the shared header. Each function:
+
+**Core V12 methods for Level 2:**
+
+| Function | V12 methods | Key technique |
+|---|---|---|
+| sgemv/dgemv (no-transpose) | V12.TILE + V12.REDUCE | SLM tile M_tile×K_tile; subgroup reduce over K (V12.REDUCE) |
+| sgemv/dgemv (transpose) | V12.TILE + V12.REDUCE | One output per WG; reduce over M |
+| sger/dger | V12.TILE + V12.FUSE | Tile M×N; fuse add+writeback |
+| ssyr/dsyr | V12.ELIDE + V12.TILE | Compute upper triangle only |
+| ssyr2/dyr2 | V12.ELIDE + V12.TILE | Compute upper triangle only |
+| ssymv/dsymv | V12.ELIDE + V12.TILE | Skip redundant triangle; tile over non-zero region |
+| strmv/dtrmv | V12.ELIDE + V12.TILE | Skip zero triangle; workgroup tile |
+| trsv/dttrsv | V12.ELIDE + V12.TILE + V12.REDUCE (rethink) | Forward sub sequential; panel-batch |
+| gbmv/dgbmv | V12.ELIDE + V12.TILE | Skip out-of-band zeros; tile over band |
+| sbmv/dbhmv | V12.ELIDE + V12.TILE | Skip zeros; symmetric band |
+| tbmv/dtbmv | V12.ELIDE + V12.TILE | Packed banded triangular |
+| tbsv/dtbsv | V12.ELIDE + V12.TILE + V12.REDUCE | Forward sub with banded skip |
+| spmv/dspmv (packed symv) | V12.ELIDE + V12.TILE | Unpack on-the-fly; exploit symmetry |
+
+**Implementation rules:**
+- Each function creates a WorkloadContract before timing (R3)
+- Validates against CPU reference (R4)
+- R6: baseline comparison against OpenBLAS x86_64 kernels at equal parallelism
+- SLM staging per P3 (VPU_CELL_CONCEPTS §1: "software-managed local store")
+- H-G: alignment check on tile boundaries (reject misaligned descriptors)
+- H-F: declared SLM budget; reject if exceeds runtime-queried limit
+- Record workgroup shape + shader hash in every result (R8)
+
+### Debug-hypothesis blocks to implement (R1 compliance):
+
+1. **H-GEMV-TILE-1:** For sgemv no-transpose, SLM tile of 256×64 (rows×K-chunk)
+   saturates L2 bandwidth on Xe-LPG. Below 256 outputs, dispatch overhead
+   dominates. Decision rule: if M < 512 → CPU; if M ≥ 512 → GPU with tile.
+   *Test:* sweep M from 64 to 8192, compare GPU-tiled vs CPU-OpenBLAS at
+   equal thread count. Kill if GPU <5% faster at M ≥ 512.
+
+2. **H-GEMV-TRANS-1:** Transpose GEMV (y = A^T x) has no data sharing between
+   output elements. Hypothesis: SLM tile does not help; GPU only wins when
+   M × K > L2 size. Decision: if M×K > 16M elements → GPU SLM tile;
+   else CPU. *Test:* vary M=1..8192, K=1..8192; measure bandwidth
+   (GB/s) for both paths.
+
+3. **H-SYMM-ELIDE-1:** ssymv with V12.ELIDE (skip upper triangle) computes
+   N(N+1)/2 vs N² elements. Hypothesis: GPU wins only when the 2x work reduction
+   + SLM tile overcomes dispatch overhead. Decision: triangle size > 4096²
+   → GPU; else CPU. *Kill:* if elision saves < 10% at 4096².
+
+4. **H-TRSV-SEQUENTIAL-1:** Forward substitution is inherently sequential
+   along the diagonal. Hypothesis: GPU panel-solve with V12.REDUCE for
+   panel-level parallelism only beats CPU when panel count > EU count (128).
+   *Kill:* if M < 128×128 → force CPU.
+
+### Provenance:
+- Matrix-vector algorithms: Lawson et al. (1979) §5–6; Golub & Van Loan (2013) §3.2
+- V12 methods: VPU_CLEANROOM_POLICY_v0.1.md §5
+- Cell SLM: arXiv:0710.2442 §2 (local store), arXiv:0910.2324 §3 (DMA staging)
+- OpenVINO MatMul/Eltwise: openvino_backend.cpp:3 (Class B)
+- Tile sweep methodology: VPU_CELL_CONCEPTS §5.3 (H-C placement sweep)
+
+OUTPUT ONLY CODE BLOCKS. Do not touch Shard A or C files.

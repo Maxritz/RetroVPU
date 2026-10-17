@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <chrono>
+#include <openvino/openvino.hpp>
 #include "context.hpp"
 #include "tensor.hpp"
 
@@ -26,55 +28,85 @@ public:
     void CompileModel(const std::string& model_path);
     
     const DeviceInfo& device_info() const { return device_info_; }
-    ov::CompiledModel compiled_model() const { return compiled_model_; }
     
-    // V12 GPU dispatch methods (stubs: return empty to trigger CPU fallback)
-    std::vector<float> RunDot(size_t N, const float* x, const float* y, const std::string& device) {
-        (void)N; (void)x; (void)y; (void)device; return {};
-    }
-    std::vector<float> RunReduceSum(size_t N, const float* data, const std::string& device) {
-        (void)N; (void)data; (void)device; return {};
-    }
-    std::vector<float> RunAmax(size_t N, const float* x, const std::string& device) {
-        (void)N; (void)x; (void)device; return {};
-    }
-    std::vector<float> RunScal(size_t N, float alpha, float* x, const std::string& device) {
-        (void)N; (void)alpha; (void)x; (void)device; return {};
-    }
-    std::vector<float> RunAxpy(size_t N, float alpha, const float* x, float* y, const std::string& device) {
-        (void)N; (void)alpha; (void)x; (void)y; (void)device; return {};
-    }
-    std::unique_ptr<Tensor> RunGemv(bool trans, size_t M, size_t N, float alpha, float beta,
-                                    const float* A, const float* x, float* y, const std::string& device) {
-        (void)trans; (void)M; (void)N; (void)alpha; (void)beta; (void)A; (void)x; (void)y; (void)device;
-        return nullptr;
-    }
+    // V12 GPU dispatch methods - execute V12 methods on GPU (OpenVINO)
+    // V12.REDUCE: Dot product (sum of element-wise products)
+    std::vector<float> RunDot(size_t N, const float* x, const float* y, const std::string& device = "GPU", size_t work_group_size = 256);
+    
+    // V12.REDUCE: Subgroup parallel reduction
+    std::vector<float> RunReduceSum(size_t N, const float* data, const std::string& device = "GPU", size_t work_group_size = 256);
+    
+    // V12.REDUCE: Find maximum absolute value (used in ASUM, NRM2)
+    std::vector<float> RunAmax(size_t N, const float* x, const std::string& device = "GPU", size_t work_group_size = 256);
+    
+    // V12.FUSE: Fused Scale (x = alpha * x)
+    std::vector<float> RunScal(size_t N, float alpha, const float* x, const std::string& device = "GPU", size_t work_group_size = 256);
+    
+    // V12.FUSE: Fused AXPY (y = alpha * x + y)
+    std::vector<float> RunAxpy(size_t N, float alpha, const float* x, const float* y, 
+                               const std::string& device = "GPU", size_t work_group_size = 256);
+    
+    // V12.TILE + V12.REDUCE + V12.FUSE: Gemv (General Matrix-Vector Multiply)
+    // Returns result vector (empty on failure → triggers CPU fallback)
+    std::vector<float> RunGemv(bool trans, size_t M, size_t N, float alpha, float beta,
+                               const float* A, const float* x, float* y_out, const std::string& device = "GPU");
+    
+    // V12.TILE + V12.REDUCE + V12.FUSE: Gemv FP64 (double precision)
+    // Returns result vector (empty on failure → triggers CPU fallback)
     std::vector<double> RunGemvFP64(bool trans, size_t M, size_t N, double alpha, double beta,
-                                    const double* A, const double* x, double* y, const std::string& device) {
-        (void)trans; (void)M; (void)N; (void)alpha; (void)beta; (void)A; (void)x; (void)y; (void)device;
-        return {};
-    }
+                                    const double* A, const double* x, double* y_out, const std::string& device = "GPU");
+    
+    // V12.FUSE: Ger (General Rank-1 update: A = alpha * x * y^T + A)
     std::vector<float> RunGer(size_t M, size_t N, float alpha, const float* x,
-                              const float* y, float* A, const std::string& device) {
-        (void)M; (void)N; (void)alpha; (void)x; (void)y; (void)A; (void)device; return {};
-    }
+                              const float* y, float* A_out, const std::string& device = "GPU");
+    
+    // V12.TILE + V12.REDUCE: Batch GEMV (batched matrix-vector multiply)
     std::vector<float> RunBatchGemv(size_t batch_size, size_t M, size_t N, float alpha,
                                     const float* A_batch, const float* x_batch,
-                                    float* y_batch, const std::string& device) {
-        (void)batch_size; (void)M; (void)N; (void)alpha; (void)A_batch; (void)x_batch;
-        (void)y_batch; (void)device; return {};
-    }
+                                    float* y_batch, const std::string& device = "GPU");
+
+    // Timing breakdown (R7) - returned via output parameters
+    struct ExecutionTimings {
+        double gpu_time_us = 0.0;      // GPU-timestamp execution
+        double host_time_us = 0.0;     // host submission/recording
+        double e2e_time_us = 0.0;      // end-to-end
+    };
+    
+    // Get timings from last execution (R7)
+    ExecutionTimings GetLastTimings() const { return last_timings_; }
+    
+    // Device info accessors (R8)
+    std::string GetDeviceName() const { return device_name_; }
+    std::string GetDriverVersion() const;
+    std::string GetApiVersion() const;
     
 private:
     OpenVINOBackend(std::shared_ptr<Context> context, 
                     const std::string& device_name,
-                    ov::CompiledModel compiled_model,
                     DeviceInfo device_info);
     
+    // Helper: Create a reusable compiled model cache key
+    std::string CreateCacheKey(const std::string& op_type, size_t M, size_t N, size_t K) const;
+    
+    // Helper: Get or compile a model for specific operation
+    ov::CompiledModel GetOrCreateMatMulModel(size_t M, size_t N, size_t K);
+    
+    // Helper: Copy host data to OpenVINO tensor
+    void FillTensor(ov::Tensor& tensor, const float* data, size_t size);
+    void FillTensor(ov::Tensor& tensor, const double* data, size_t size);
+    
+    // Helper: Copy OpenVINO tensor data to host
+    void CopyToHost(const ov::Tensor& tensor, float* data, size_t size);
+    void CopyToHost(const ov::Tensor& tensor, double* data, size_t size);
+    
     std::shared_ptr<Context> context_;
+    ov::Core core_;  // Cached core for model compilation
     std::string device_name_;
-    ov::CompiledModel compiled_model_;
     DeviceInfo device_info_;
+    ExecutionTimings last_timings_;
+    
+    // Compiled model cache (for reuse across batches - V12.FUSE)
+    std::map<std::string, ov::CompiledModel> compiled_models_;
 };
 
 } // namespace VPU

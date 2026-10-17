@@ -1,0 +1,142 @@
+========================================
+DEPLOY-3 SHARD A: Infrastructure + Level 1 BLAS
+========================================
+
+## SHARED INTERFACE (frozen — same for all shards A/B/C)
+
+All code goes under NEW-VPU/src/blas/. Every file must have the provenance header:
+
+```
+// VPU-CR-PROVENANCE
+// Mechanism:  <V12 method or Cell concept, e.g. "P3 staged local store; V12.REDUCE">
+// Derived-from: <arXiv or DOI id>, <section>
+// Spec entry: spec/blas.md#<anchor>
+// Author:     agent:<model>@deploy3-shardA
+// Exposure:   none
+```
+
+### Common header: src/blas/vpu_blas.hpp
+
+```cpp
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <memory>
+#include <vector>
+#include "core/context.hpp"
+#include "model/tensor.hpp"
+#include "harness/workload_contract.hpp"
+
+namespace VPU {
+
+// V12 method tags (R12: intent only, not evidence)
+enum V12Method : uint32_t {
+    V12_NONE       = 0,
+    V12_FUSE       = 1 << 0,
+    V12_ELIDE      = 1 << 1,
+    V12_REDUCE     = 1 << 2,
+    V12_PRECISION  = 1 << 3,
+    V12_TILE       = 1 << 4,
+    V12_COST_GATE  = 1 << 5,
+};
+
+// BLAS function categories for dispatch
+enum class BLASLevel { L1, L2, L3 };
+enum class BLASType {
+    DOT, NRM2, ASUM, AMAX, AXPY, SCAL, COPY, SWAP, ROT,  // L1
+    GEMV, GER, SYR, SYR2, SYMV, TRMV, TRSV, GBMV, SBMV, SPMV, SPK, TBMV, TBSV, TPMV, TPSV, // L2
+    GEMM, SYMM, SYRK, SYR2K, TRMM, TRSM, GEMM_BATCH, GEMM_BATCH_STRIDED, // L3
+    OMATCOPY, IMATCOPY, GEADD, // memory
+};
+
+// Device routing result from V12.COST-GATE
+struct DevicePlan {
+    DeviceType target;        // CPU, GPU, or NPU
+    V12Method methods;        // which V12 methods to apply
+    size_t workgroup_size;    // for GPU
+    size_t tile_m, tile_n, tile_k;  // for V12.TILE
+};
+
+class V12CostModel {
+public:
+    // Decide device + V12 methods based on shape and function
+    static DevicePlan Route(BLASType fn, size_t M, size_t N, size_t K, DType dt);
+};
+
+class VPU_BLAS {
+public:
+    explicit VPU_BLAS(std::shared_ptr<Context> ctx) : context_(std::move(ctx)) {}
+
+    // --- Level 1 (this shard) ---
+    float sdot(size_t n, const float* x, size_t incx, const float* y, size_t incy);
+    double ddot(size_t n, const double* x, size_t incx, const double* y, size_t incy);
+    float snrm2(size_t n, const float* x, size_t incx);
+    double dnrm2(size_t n, const double* x, size_t incx);
+    float sasum(size_t n, const float* x, size_t incx);
+    double dasum(size_t n, const double* x, size_t incy);
+    size_t isamax(size_t n, const float* x, size_t incx);
+    void saxpy(size_t n, float alpha, const float* x, size_t incx, float* y, size_t incy);
+    void daxpy(size_t n, double alpha, const double* x, size_t incx, double* y, size_t incy);
+    void sscal(size_t n, float alpha, float* x, size_t incx);
+    void dscal(size_t n, double alpha, double* x, size_t incx);
+    void scopy(size_t n, const float* x, size_t incx, float* y, size_t incy);
+    void dcopy(size_t n, const double* x, size_t incx, double* y, size_t incy);
+    void sswap(size_t n, float* x, size_t incx, float* y, size_t incy);
+    void dswap(size_t n, double* x, size_t incx, double* y, size_t incy);
+    void srot(size_t n, float* x, size_t incx, float* y, size_t incy, float c, float s);
+    void drot(size_t n, double* x, size_t incx, double* y, size_t incy, double c, double s);
+    void sgemv(...);  // declared here, implemented in Shard B
+    void sgemm(...);  // declared here, implemented in Shard C
+
+    // --- Shared helpers ---
+    WorkloadContract MakeContract(BLASType fn, V12Method methods, size_t M, size_t N, size_t K, DType dt);
+
+private:
+    std::shared_ptr<Context> context_;
+};
+
+} // namespace VPU
+```
+
+## YOUR TASK (Shard A only):
+
+### 1. Create src/blas/vpu_blas.hpp
+The shared header above. This is the frozen interface that Shards B and C will use.
+Copy it exactly — no changes unless you also update B and C.
+
+### 2. Create src/blas/vpu_level1.hpp and src/blas/vpu_level1.cpp
+Implement ALL Level 1 functions listed in the header. Each function:
+- Creates a WorkloadContract (R3) before timing (R7)
+- Uses V12.COST-GATE to decide CPU vs GPU (R10: cost-gated, not rules)
+- For reductions (dot, nrm2, asum, amax): V12.REDUCE — subgroup-parallel reduction
+  on GPU when N > threshold (debug-hypothesis: N > 65536); CPU fallback for small N
+- For elementwise (axpy, scal, copy, swap, rot): V12.FUSE with consumer if available;
+  direct elementwise op via OpenVINO Eltwise
+- Each function must validate correctness against CPU reference (R4)
+- Record environment (R8): device, GPU version, workgroup shape, shader hash
+
+### 3. Create src/blas/vpu_cost_model.cpp (part of Shard A)
+Implement V12CostModel::Route() — the cost-gated router that decides:
+- Level 1 elementwise: CPU if N < 8192, GPU if batched or N large
+- Level 1 reductions: CPU if N < 65536, GPU with V12.REDUCE if larger
+- Returns DevicePlan with method tags
+
+### Key references:
+- NEW-VPU/src/harness/benchmark.hpp:100 — RunBenchmark pattern
+- NEW-VPU/src/harness/workload_contract.hpp:67 — WorkloadContract struct
+- NEW-VPU/src/core/context.hpp:33 — Context, GetAvailableDevices
+- NEW-VPU/src/main.cpp:146 — contract creation pattern
+- NEW-VPU/src/model/moe_layer.cpp:111 — GEMV-like matmul (reference for matrix-vector)
+- VPU_CELL_CONCEPTS_v0.1.md §2 — SLM query at runtime (H-F)
+- VPU_CELL_CONCEPTS_v0.1.md §5.2 — Workgroup/tile shape sweep (H-C)
+- VPU_CELL_CONCEPTS_v0.1.md §8.1 — Trace schema for slot_id, workgroup_shape
+
+### Provenance:
+- BLAS reference algorithm: Lawson et al. (1979) BLAS Technical Report
+- V12 methods: VPU_CLEANROOM_POLICY_v0.1.md §5 (method catalogue)
+- Cell staging: arXiv:0710.2442 §2; arXiv:0910.2324 §3
+- OpenVINO API: openvino_backend.cpp:3 (Class B, public API only)
+- SIMD detection: cpuid.h (Class B header)
+
+OUTPUT ONLY CODE BLOCKS. Do not create files for Shards B or C.

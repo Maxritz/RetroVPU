@@ -1,0 +1,17 @@
+=== VPU BLAS R1-R12 Compliance Benchmark ===
+
+Devices: CPU GPU NPU 
+
+  sdot                [N=16384] V12=sgemv-l1-sdot  vs  sgemv-l1-sdot-baseline  speedup=4.0x  [SIGNIFICANT]
+  snrm2               [N=16384] V12=snrm2-v12  vs  snrm2-baseline  speedup=1.0x  [~equal]
+  saxpy               [N=16384] V12=saxpy-v12  vs  saxpy-baseline  speedup=1.3x  [SIGNIFICANT]
+  sasum               [N=16384] V12=sasum-v12  vs  sasum-baseline  speedup=3.7x  [SIGNIFICANT]
+  sscal               [N=16384] V12=sscal-v12  vs  sscal-baseline  speedup=1.3x  [SIGNIFICANT]
+  isamax              [N=32768] V12=isamax-v12  vs  isamax-baseline  speedup=1.0x  [~equal]
+  sgemv               [M=512 N=256] V12=sgemv-v12  vs  sgemv-baseline  speedup=0.5x  [INCONCLUSIVE]
+  batch-gemv          [16x256x256] V12=batch-gemv-v12  vs  batch-gemv-baseline  speedup=0.1x  [INCONCLUSIVE]
+
+=== Benchmark complete ===
+R1: warmup=10, measured=30, median+spread reported
+R5: V12 variants vs CPU-Ref baseline, named explicitly
+R1: [INCONCLUSIVE] = 95% CI overlaps 1.0 speedup ratio

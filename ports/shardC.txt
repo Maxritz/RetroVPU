@@ -1,0 +1,124 @@
+========================================
+DEPLOY-3 SHARD C: Level 3 BLAS + memory + dispatch
+========================================
+
+## SHARED INTERFACE (frozen — same as Shard A and B)
+The header `src/blas/vpu_blas.hpp` is created by Shard A and contains the
+V12Method enum, BLASType enum, DevicePlan struct, V12CostModel class, and
+VPU_BLAS class with all Level 1 (done by A) and Level 2 (done by B)
+declarations already implemented.
+
+Level 3 declarations YOU implement (already declared in header):
+  sgemm, dgemm, cgemm, zgemm,
+  ssymm, dsymm,
+  ssyrk, dsyrk, ssyr2k, dsyr2k,
+  strmm, dtrmm,
+  strsm, dtrsm,
+  sgemm_batch, dgemm_batch,
+  sgemm_batch_strided, dgemm_batch_strided,
+  sgemmt, dgemmt (full triangle variant),
+  sbgemm (BF16, new extension)
+
+Also implement memory layout ops:
+  sgemv is in Shard B; you implement:
+  somatcopy, domatcopy, simatcopy, dimatcopy, geadd
+
+## YOUR TASK (Shard C only):
+
+### 1. Create src/blas/vpu_level3.hpp
+All Level 3 + memory function declarations.
+
+### 2. Create src/blas/vpu_level3.cpp
+Implement ALL Level 3 and memory functions. Each function:
+
+**Core V12 methods for Level 3:**
+
+| Function | V12 methods | Key technique |
+|---|---|---|
+| sgemm/dgemm | V12.TILE + V12.FUSE + V12.PRECISION | OpenVINO MatMul; tile M×N×K; INT8 if tolerance OK |
+| ssymm/dsymm | V12.ELIDE (symmetry) + V12.TILE | Compute only lower/upper of A |
+| ssyrk/dsyrk | V12.ELIDE + V12.TILE + V12.FUSE | Compute only C triangle; fuse read C + write |
+| ssyr2k/dsyr2k | V12.ELIDE + V12.TILE + V12.FUSE | Two GEMMs in one; upper triangle only |
+| strmm/dtrmm | V12.ELIDE + V12.TILE | Skip zero triangle; tile M×N |
+| strsm/dtrsm | V12.TILE + V12.COST-GATE (rethink) | Panel solve; CPU for sequential, GPU for parallel panels |
+| sgemm_batch | V12.FUSE | Group N small GEMMs into one big GEMM if shapes compatible |
+| sgemm_batch_strided | V12.FUSE + V12.TILE | Map to OpenVINO batched; tile per element |
+| sbgemm (new) | V12.PRECISION | BF16 compute, FP32 accumulate; native on Xe-LPG |
+
+**Memory layout ops:**
+
+| Function | V12 methods | Key technique |
+|---|---|---|
+| somatcopy/domatcopy | V12.TILE + V12.FUSE | SLM transpose tile; fuse transpose + scale |
+| simatcopy/dimatcopy | V12.TILE | In-place transpose; SLM buffer, tile 32×32 |
+| geadd | V12.FUSE + V12.TILE | C = alpha*A + beta*B in one kernel; tile M×N |
+
+**Heterogeneous routing (V12.COST-GATE):**
+- sgemm: GPU for M×N×K > 512×512×512; NPU for INT8 fixed-shape; CPU for small
+- ssyrk: GPU (elision halves work + GPU tile wins)
+- strsm: CPU for M < 512 (sequential dependency); GPU panel-batch for M ≥ 512
+- sgemm_batch: if N batches and all same shape → V12.FUSE into single GEMM;
+  if different → GPU batched via OpenVINO; if shapes differ → MULTI:GPU,NPU
+
+**Implementation rules:**
+- Each function creates WorkloadContract (R3, R8: bytes read/written, hash)
+- Validates against CPU reference (R4)
+- R5: best-of-both comparison: V12 method vs best OpenBLAS at equal parallelism
+- R7: GPU-timestamp, host submission, end-to-end reported separately
+- H-A: generated staging ring for host↔GPU transfers (P15)
+- H-B: timeline semaphores per transfer stream (P15 sub-point)
+- H-C: dispatch order sweep (P16) — linear vs swizzled vs blocked
+- H-F: declared SLM budget (P19) — reject if tile exceeds runtime SLM size
+- H-H: code variant count capped (P19)
+
+### Debug-hypothesis blocks:
+
+1. **H-GEMM-TILE-1:** SLM tile of 128×128×K_chunk saturates Xe-LPG memory
+   bandwidth. Hypothesis: tile depth 2 (double buffer) matches GPU throughput;
+   depth 3 adds no benefit. Decision: K_chunk = min(64, K); tile_m = tile_n
+   = min(128, M, N). Kill: if depth-3 >5% faster than depth-2 at large shapes.
+
+2. **H-GEMM-FUSE-1:** sgemm_batch with group_size=1, N batches of identical
+   shape → V12.FUSE into one (N*M)×K GEMM. Hypothesis: wins when N*M*K >
+   dispatch threshold (~4µs × N). Kill: if N < 4 batches, keep separate.
+
+3. **H-TRSM-ELIDE-1:** strsm with V12.ELIDE (skip unit-diagonal, skip
+   already-solved panels) → CPU forward sub for panel size < 64; GPU
+   panel-solve for ≥64. Kill: if CPU panel-64 > GPU panel-64 by >10%,
+   increase GPU threshold.
+
+4. **H-SYRK-ELIDE-1:** ssyrk computes N(N+1)/2 of C instead of N². With
+   V12.ELIDE + V12.TILE, GPU should win at N=2048. Kill: if no elision
+   benefit (symmetry flag not exploitable) at N=4096.
+
+### 3. Create src/blas/vpu_dispatcher.cpp
+Full dispatch table that routes CBLAS-like function calls to VPU_BLAS methods.
+This is the entry point that an OpenBLAS-compatible API wrapper would call.
+It reads the V12CostModel result and dispatches to CPU/GPU/NPU path.
+
+### CMakeLists.txt update
+Add `src/blas/CMakeLists.txt` that compiles all three shards as one library
+`vpu_blas`, links against OpenVINO and the existing VPU core.
+
+### Provenance:
+- Matrix-matrix algorithms: Lawson et al. (1979) §6; Golub & Van Loan (2013) §15
+- Blocked TRSM: Demmel et al. (1990) "An accelerated block ordering for
+  Gaussian elimination with partial pivoting" — but adapt principles only
+- V12 methods: VPU_CLEANROOM_POLICY_v0.1.md §5
+- Cell staging pipeline: VPU_CELL_CONCEPTS_v0.1.md §5 (H-A, H-B, H-C, H-F, H-H)
+- BF16 compute: Intel Xe architecture doc (Class A)
+- OpenVINO MatMul: openvino_backend.cpp:3 (Class B)
+
+OUTPUT ONLY CODE BLOCKS. Do not touch Shard A or B files.
+
+=== END OF SHARDS ===
+
+SHARED INTERFACE (frozen across all 3 shards):
+All shards include "vpu_blas.hpp" which contains:
+- V12Method enum, BLASType enum, DeviceType enum
+- DevicePlan struct {target, methods, workgroup_size, tile_m, tile_n, tile_k}
+- V12CostModel::Route(fn, M, N, K, dtype) → DevicePlan
+- VPU_BLAS class with ALL function declarations
+  (Level 1 implemented by Shard A, Level 2 by Shard B, Level 3 + memory by Shard C)
+- WorkloadContract helper (R3)
+- All files must use VPU-CR-PROVENANCE header

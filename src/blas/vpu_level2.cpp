@@ -1158,7 +1158,7 @@ void VPU_BLAS::sgemv(bool trans, size_t M, size_t N, float alpha,
 
             auto tensor = gpu_backend_->RunGemv(trans, M, N, alpha, beta,
                                                 A_row.data(), x_full.data(), y_full.data(), "GPU");
-            if (tensor) {
+            if (!tensor.empty()) {
                 for (size_t i = 0; i < y_len; ++i) y[i * incy] = y_full[i];
                 if (TraceEnabled2()) TRACE2("sgemv", "V12.GPU", us_elapsed2(_t0), true);
                 return;
@@ -1603,7 +1603,7 @@ void VPU_BLAS::ssymv(size_t N, float alpha,
                     A_full[i * N + j] = A[i + j * lda];
             auto tensor = gpu_backend_->RunGemv(false, N, N, alpha, beta,
                                                 A_full.data(), x_full.data(), y_full.data(), "GPU");
-            if (tensor) {
+            if (!tensor.empty()) {
                 for (size_t i = 0; i < N; ++i) y[i * incy] = y_full[i];
                 if (TraceEnabled2()) TRACE2("ssymv", "V12.GPU", us_elapsed2(_t0), true);
                 return;
@@ -1636,7 +1636,7 @@ void VPU_BLAS::dsymv(size_t N, double alpha,
                     A_f[i * N + j] = static_cast<float>(A[i + j * lda]);
             auto tensor = gpu_backend_->RunGemv(false, N, N, static_cast<float>(alpha),
                 static_cast<float>(beta), A_f.data(), x_f.data(), y_f.data(), "GPU");
-            if (tensor) {
+            if (!tensor.empty()) {
                 for (size_t i = 0; i < N; ++i) y[i * incy] = static_cast<double>(y_f[i]);
                 if (TraceEnabled2()) TRACE2("dsymv", "V12.GPU|V12.PRECISION", us_elapsed2(_t0), true);
                 return;
