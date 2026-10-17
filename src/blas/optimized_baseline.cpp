@@ -93,13 +93,13 @@ void OptimizedBaseline::sgemv_optimized(bool trans, size_t M, size_t N, float al
             
             threads.emplace_back([trans, start, end, M, N, alpha,
                                   A, lda, x, incx, beta, y, incy, BLOCK_SIZE]() {
-                // Per-thread optimized GEMV with AVX-512
+                // Per-thread optimized GEMV with AVX2
                 for (size_t i = start; i < end; i += BLOCK_SIZE) {
                     size_t i_block_end = std::min(i + BLOCK_SIZE, end);
                     
                     for (size_t ii = i; ii < i_block_end; ++ii) {
                         // AVX-512 vectorized accumulation
-                        __m512 sum_vec = _mm512_setzero_ps();
+                        __m256 sum_vec = _mm256_setzero_ps();
                         
                         // Prefetch x and A data
                         OptimizedBaselineHelpers::prefetch_read(x);
@@ -107,18 +107,18 @@ void OptimizedBaseline::sgemv_optimized(bool trans, size_t M, size_t N, float al
                         
                         // Vectorized inner loop with unrolling
                         size_t j = 0;
-                        for (; j + 16 <= N; j += 16) {
+                        for (; j + 8 <= N; j += 8) {
                             // Prefetch for next iteration
-                            OptimizedBaselineHelpers::prefetch_read(x + j * incx + 16 * incx);
-                            OptimizedBaselineHelpers::prefetch_read(A + (j + 16) * lda + ii);
+                            OptimizedBaselineHelpers::prefetch_read(x + j * incx + 8 * incx);
+                            OptimizedBaselineHelpers::prefetch_read(A + (j + 8) * lda + ii);
                             
-                            __m512 x_vec = _mm512_loadu_ps(x + j * incx);
-                            __m512 a_col = _mm512_loadu_ps(A + j * lda + ii);
-                            sum_vec = _mm512_fmadd_ps(x_vec, a_col, sum_vec);
+                            __m256 x_vec = _mm256_loadu_ps(x + j * incx);
+                            __m256 a_col = _mm256_loadu_ps(A + j * lda + ii);
+                            sum_vec = _mm256_fmadd_ps(x_vec, a_col, sum_vec);
                         }
                         
                         // Horizontal add
-                        float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx512(sum_vec);
+                        float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx256(sum_vec);
                         
                         // Remainder loop
                         for (; j < N; ++j) {
@@ -153,22 +153,22 @@ void OptimizedBaseline::sgemv_optimized(bool trans, size_t M, size_t N, float al
                     size_t j_block_end = std::min(j + BLOCK_SIZE, end);
                     
                     for (size_t jj = j; jj < j_block_end; ++jj) {
-                        __m512 sum_vec = _mm512_setzero_ps();
+                        __m256 sum_vec = _mm256_setzero_ps();
                         
                         OptimizedBaselineHelpers::prefetch_read(x + jj * incx);
                         OptimizedBaselineHelpers::prefetch_read(A + jj * lda);
                         
                         size_t i = 0;
-                        for (; i + 16 <= M; i += 16) {
-                            OptimizedBaselineHelpers::prefetch_read(x + jj * incx + i * incx + 16 * incx);
-                            OptimizedBaselineHelpers::prefetch_read(A + jj * lda + i + 16);
+                        for (; i + 8 <= M; i += 8) {
+                            OptimizedBaselineHelpers::prefetch_read(x + jj * incx + i * incx + 8 * incx);
+                            OptimizedBaselineHelpers::prefetch_read(A + jj * lda + i + 8);
                             
-                            __m512 x_vec = _mm512_loadu_ps(x + jj * incx + i * incx);
-                            __m512 a_row = _mm512_loadu_ps(A + jj * lda + i);
-                            sum_vec = _mm512_fmadd_ps(x_vec, a_row, sum_vec);
+                            __m256 x_vec = _mm256_loadu_ps(x + jj * incx + i * incx);
+                            __m256 a_row = _mm256_loadu_ps(A + jj * lda + i);
+                            sum_vec = _mm256_fmadd_ps(x_vec, a_row, sum_vec);
                         }
                         
-                        float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx512(sum_vec);
+                        float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx256(sum_vec);
                         
                         for (; i < M; ++i) {
                             scalar_sum += A[jj * lda + i] * x[i * incx];
@@ -186,7 +186,7 @@ void OptimizedBaseline::sgemv_optimized(bool trans, size_t M, size_t N, float al
     }
 }
 
-// Optimized DGEMV with AVX-512, cache-blocking, multi-threading
+// Optimized DGEMV with cache-blocking, multi-threading
 void OptimizedBaseline::dgemv_optimized(bool trans, size_t M, size_t N, double alpha,
                                         const double* A, size_t lda,
                                         const double* x, size_t incx,
@@ -284,19 +284,19 @@ void OptimizedBaseline::ssyr_optimized(size_t N, float alpha,
                 size_t j_block_end = std::min(j + BLOCK_SIZE, end);
                 
                 for (size_t jj = j; jj < j_block_end; ++jj) {
-                    __m512 sum_vec = _mm512_setzero_ps();
+                    __m256 sum_vec = _mm256_setzero_ps();
                     
                     OptimizedBaselineHelpers::prefetch_read(x + jj * incx);
                     OptimizedBaselineHelpers::prefetch_read(A + jj * lda);
                     
                     size_t i = jj;
-                    for (; i + 16 <= jj + 1; i += 16) {
-                        __m512 x_vec = _mm512_loadu_ps(x + i * incx);
-                        __m512 a_row = _mm512_loadu_ps(A + jj * lda + i);
-                        sum_vec = _mm512_fmadd_ps(x_vec, a_row, sum_vec);
+                    for (; i + 8 <= jj + 1; i += 8) {
+                        __m256 x_vec = _mm256_loadu_ps(x + i * incx);
+                        __m256 a_row = _mm256_loadu_ps(A + jj * lda + i);
+                        sum_vec = _mm256_fmadd_ps(x_vec, a_row, sum_vec);
                     }
                     
-                    float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx512(sum_vec);
+                    float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx256(sum_vec);
                     
                     for (; i <= jj; ++i) {
                         scalar_sum += A[jj * lda + i] * x[i * incx];
@@ -333,24 +333,24 @@ void OptimizedBaseline::ssyr2_optimized(size_t N, float alpha,
                 size_t j_block_end = std::min(j + BLOCK_SIZE, end);
                 
                 for (size_t jj = j; jj < j_block_end; ++jj) {
-                    __m512 sum1 = _mm512_setzero_ps();
-                    __m512 sum2 = _mm512_setzero_ps();
+                    __m256 sum1 = _mm256_setzero_ps();
+                    __m256 sum2 = _mm256_setzero_ps();
                     
                     OptimizedBaselineHelpers::prefetch_read(x + jj * incx);
                     OptimizedBaselineHelpers::prefetch_read(y + jj * incy);
                     OptimizedBaselineHelpers::prefetch_read(A + jj * lda);
                     
                     size_t i = jj;
-                    for (; i + 16 <= jj + 1; i += 16) {
-                        __m512 x_vec = _mm512_loadu_ps(x + i * incx);
-                        __m512 y_vec = _mm512_loadu_ps(y + i * incy);
-                        __m512 a_row = _mm512_loadu_ps(A + jj * lda + i);
-                        sum1 = _mm512_fmadd_ps(x_vec, a_row, sum1);
-                        sum2 = _mm512_fmadd_ps(y_vec, a_row, sum2);
+                    for (; i + 8 <= jj + 1; i += 8) {
+                        __m256 x_vec = _mm256_loadu_ps(x + i * incx);
+                        __m256 y_vec = _mm256_loadu_ps(y + i * incy);
+                        __m256 a_row = _mm256_loadu_ps(A + jj * lda + i);
+                        sum1 = _mm256_fmadd_ps(x_vec, a_row, sum1);
+                        sum2 = _mm256_fmadd_ps(y_vec, a_row, sum2);
                     }
                     
-                    float scalar_sum1 = OptimizedBaselineHelpers::horizontal_add_avx512(sum1);
-                    float scalar_sum2 = OptimizedBaselineHelpers::horizontal_add_avx512(sum2);
+                    float scalar_sum1 = OptimizedBaselineHelpers::horizontal_add_avx256(sum1);
+                    float scalar_sum2 = OptimizedBaselineHelpers::horizontal_add_avx256(sum2);
                     
                     for (; i <= jj; ++i) {
                         scalar_sum1 += A[jj * lda + i] * x[i * incx];
@@ -388,24 +388,24 @@ void OptimizedBaseline::sger_optimized(size_t M, size_t N, float alpha,
                 size_t i_block_end = std::min(i + BLOCK_SIZE, end);
                 
                 for (size_t ii = i; ii < i_block_end; ++ii) {
-                    __m512 sum_vec = _mm512_setzero_ps();
+                    __m256 sum_vec = _mm256_setzero_ps();
                     
                     OptimizedBaselineHelpers::prefetch_read(x + ii * incx);
                     OptimizedBaselineHelpers::prefetch_read(y);
                     OptimizedBaselineHelpers::prefetch_read(A + ii);
                     
                     size_t j = 0;
-                    for (; j + 16 <= N; j += 16) {
-                        OptimizedBaselineHelpers::prefetch_read(x + ii * incx + j * incx + 16 * incx);
-                        OptimizedBaselineHelpers::prefetch_read(y + j * incy + 16 * incy);
-                        OptimizedBaselineHelpers::prefetch_read(A + ii + j * lda + 16);
+                    for (; j + 8 <= N; j += 8) {
+                        OptimizedBaselineHelpers::prefetch_read(x + ii * incx + j * incx + 8 * incx);
+                        OptimizedBaselineHelpers::prefetch_read(y + j * incy + 8 * incy);
+                        OptimizedBaselineHelpers::prefetch_read(A + ii + j * lda + 8);
                         
-                        __m512 x_vec = _mm512_loadu_ps(x + ii * incx + j * incx);
-                        __m512 y_vec = _mm512_loadu_ps(y + j * incy);
-                        sum_vec = _mm512_fmadd_ps(x_vec, y_vec, sum_vec);
+                        __m256 x_vec = _mm256_loadu_ps(x + ii * incx + j * incx);
+                        __m256 y_vec = _mm256_loadu_ps(y + j * incy);
+                        sum_vec = _mm256_fmadd_ps(x_vec, y_vec, sum_vec);
                     }
                     
-                    float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx512(sum_vec);
+                    float scalar_sum = OptimizedBaselineHelpers::horizontal_add_avx256(sum_vec);
                     
                     for (; j < N; ++j) {
                         scalar_sum += x[ii * incx] * y[j * incy];

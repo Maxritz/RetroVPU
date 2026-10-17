@@ -196,7 +196,7 @@ std::vector<float> OpenVINOBackend::RunReduceSum(size_t N, const float* data, co
             result[0] = output_tensor.data<float>()[0];
         }
         return result;
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }
@@ -261,7 +261,7 @@ std::vector<float> OpenVINOBackend::RunDot(size_t N, const float* x, const float
         last_timings_.e2e_time_us = duration_cast<microseconds>(t_end - t_start).count();
         
         return result;
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }
@@ -437,7 +437,7 @@ std::vector<float> OpenVINOBackend::RunGemv(bool trans, size_t M, size_t N, floa
         // Return result vector for compatibility with vpu_level2.cpp interface
         std::vector<float> result(y_out, y_out + rows);
         return result;
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }
@@ -525,7 +525,7 @@ std::vector<double> OpenVINOBackend::RunGemvFP64(bool trans, size_t M, size_t N,
         // Return result vector for compatibility with vpu_level2.cpp interface
         std::vector<double> result(y_out, y_out + rows);
         return result;
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }
@@ -608,7 +608,7 @@ std::vector<float> OpenVINOBackend::RunGer(size_t M, size_t N, float alpha, cons
         
         // Return result vector (for compatibility with vpu_level2.cpp interface)
         return std::vector<float>(out_data, out_data + M * N);
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }
@@ -693,7 +693,7 @@ std::vector<float> OpenVINOBackend::RunBatchGemv(size_t batch_size, size_t M, si
         
         // Return result vector (for compatibility with vpu_level2.cpp interface)
         return std::vector<float>(out_data, out_data + total_elements);
-    } catch (const std::exception& e) {
+    } catch (...) {
         last_timings_.e2e_time_us = 0;
         return {};
     }

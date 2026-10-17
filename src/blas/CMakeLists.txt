@@ -26,11 +26,12 @@ target_include_directories(vpu_blas PUBLIC
 
 target_compile_features(vpu_blas PUBLIC cxx_std_17)
 
-# Enable AVX-512 for optimized baseline (R10: cost-gated, CPU-only paths)
+# Enable AVX2+AVX-VNNI for optimized baseline (R10: cost-gated, CPU-only paths)
+# Intel Core Ultra 5 135H supports AVX2 + FMA3 + AVX-VNNI but NOT AVX-512
 if(MSVC)
-    target_compile_options(vpu_blas PRIVATE /arch:AVX512)
+    target_compile_options(vpu_blas PRIVATE /arch:AVX2)
 else()
-    target_compile_options(vpu_blas PRIVATE -mavx512f -mavx512dq)
+    target_compile_options(vpu_blas PRIVATE -mavx2 -mfma)
 endif()
 
 # Link against existing project libraries (Class B: OpenVINO SDK headers only)

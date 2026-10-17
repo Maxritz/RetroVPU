@@ -1113,7 +1113,6 @@ void VPU_BLAS::sgemv(bool trans, size_t M, size_t N, float alpha,
     auto _t0 = TraceEnabled2() ? Clock2::now() : Clock2::time_point{};
 
     // R6: Compare V12.GPU vs Optimized-OpenBLAS baseline, per shape
-    // Choose the better performer based on empirical benchmarks
     bool use_optimized_baseline = (M * N * 2 >= 512 * 1024);  // 512K elements threshold
 
     if (use_optimized_baseline) {

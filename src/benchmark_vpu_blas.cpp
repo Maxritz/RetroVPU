@@ -219,7 +219,7 @@ int main() {
                 }
             }, env);
             auto cmp = harness->CompareVariants(v12, baseline);
-        print_comparison("sgemv", cmp, "M=" + std::to_string(M) + " N=" + std::to_string(N));
+            print_comparison("sgemv", cmp, "M=" + std::to_string(M) + " N=" + std::to_string(N));
         }
 
         // ── V12.FUSE: Batch GEMV (pre-warmed, 16 kernels in single dispatch) ──
