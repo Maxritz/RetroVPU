@@ -122,12 +122,12 @@ spec/              # Legacy spec directory (referenced by headers)
 
 | Method | Status | Implementation |
 |--------|--------|---------------|
-| V12.ELIDE | ✅ Implemented | Top-K sparse compute in MoE gating; triangular index mirroring in SYMM (saves ~50% memory bandwidth) |
-| V12.PRECISION | ✅ Implemented | INT8 quantized weights vs FP32 baseline; mixed precision dispatch |
-| V12.FUSE | ✅ Implemented | Fused MoE expert dispatch; fused GEMM/GEMV epilogue operations |
-| V12.REDUCE | ✅ Implemented | Subgroup tree-reduce for K-accumulation in GEMM/GEMV/SYMM; batch reduction in Level 1 |
-| V12.TILE | ✅ Implemented | 64×64 tiles for GEMV; 16×16 micro-tiles for SYMM; adaptive tile sizing (128×64→256×256) |
-| V12.COST-GATE | ✅ Implemented | Dynamic cost model; M*N threshold gates GPU dispatch; CPU vs GPU routing
+| V12.ELIDE | ✅ Implemented | Top-K sparse compute in MoE gating, triangular index mirroring in SYMM (~50% bandwidth savings) |
+| V12.PRECISION | ✅ Implemented | INT8 quantized weights vs FP32 baseline, mixed precision dispatch |
+| V12.FUSE | ✅ Implemented | Fused MoE expert dispatch, fused GEMM/GEMV epilogue operations |
+| V12.REDUCE | ✅ Implemented | AVX2 horizontal reductions for K-accumulation in GEMM/GEMV/SYMM |
+| V12.TILE | ✅ Implemented | 64×64 tiles for GEMV, 16×16 micro-tiles for SYMM |
+| V12.COST-GATE | ✅ Implemented | Dynamic cost model, M*N threshold gates GPU dispatch |
 
 ## License
 
