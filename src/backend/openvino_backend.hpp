@@ -1,6 +1,11 @@
 // VPU-CR-PROVENANCE
 // Mechanism:  P3 staged local store (OpenVINO backend context)
 // Derived-from: OpenVINO C++ API documentation (vendor specification, Class B)
+// V12.VPU.Cell concepts applied:
+//   - P3 staged local store: Compiled model cache reuses GPU kernels (avoids recompilation overhead)
+//   - Deep command FIFO: V12.FUSE batches N ops into 1 dispatch via OpenVINO graph optimization
+//   - On-board buffer I/O: Direct GPU buffer reads/writes, no host round-trips in steady-state
+//   - Per-pixel lighting (DOT4): MatMul-based dot product reduction (V12.REDUCE) 
 // Spec entry: spec/backend.md#openvino
 // Author:     agent:claude@opencodo-vpu-session-001
 // Exposure:   none
@@ -17,6 +22,11 @@
 
 namespace VPU {
 
+// V12.VPU.Cell adaptation for OpenVINO:
+// - P3 staged local store: Model compilation cached, reused across calls (avoids recompile)
+// - Deep command FIFO: V12.FUSE via OpenVINO graph fusion (single dispatch for batched ops)
+// - Direct buffer I/O: ov::Tensor maps GPU memory, no host round-trip in steady-state
+// - DOT4-style compute: MatMul ops implement V12.REDUCE (per-element dot products)
 class OpenVINOBackend {
 public:
     static std::unique_ptr<OpenVINOBackend> Create(std::shared_ptr<Context> context,

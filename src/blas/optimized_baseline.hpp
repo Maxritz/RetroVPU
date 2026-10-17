@@ -1,7 +1,10 @@
 // VPU-CR-PROVENANCE
-// Mechanism: Optimized OpenBLAS reference implementation
-// Derived-from: OpenBLAS reference implementation patterns
-// Enhanced with AVX2 SIMD, cache-blocking, multi-threading, prefetching, loop unrolling
+// Mechanism:  P3 staged local store, cache-blocking, multi-threading (CPU fallback path)
+// Derived-from: OpenBLAS reference implementation patterns (hand-authored clean-room, R6)
+// V12.VPU.Cell concepts applied:
+//   - P3 staged local store: Cache-blocking (64×64 tiles) stages data in L2/L3 cache
+//   - Deep command FIFO: Thread pool dispatches work in chunks (analogous to batched dispatches)
+//   - Per-pixel lighting: SIMD horizontal reduction (V12.REDUCE) via AVX2
 // Author: agent:optimized-baseline
 // Exposure: none
 
